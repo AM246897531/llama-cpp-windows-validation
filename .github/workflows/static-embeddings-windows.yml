@@ -1,0 +1,86 @@
+name: Pinned static embedding Windows component spike
+on:
+  push:
+    branches: [bench/windows-dicta-validation]
+    paths: [spikes/s4-static-embeddings.py, spikes/s4-static-embeddings-dependencies.json, spikes/s4-static-embeddings-requirements-windows.txt, spikes/s4-static-windows.ps1, .github/workflows/static-embeddings-windows.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  component:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Prepare hash-pinned public assets and isolated wheel toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PYTHONDONTWRITEBYTECODE = '1'
+          python spikes/s4-static-embeddings.py prepare --assets work/models/potion-multilingual-128M --wheelhouse work/toolchains/s4-static-wheelhouse --wheel-platform windows
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned asset/wheel preparation failed' }
+          python -m venv work/toolchains/s4-static-onnx
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated Python3.12 venv creation failed' }
+          & work/toolchains/s4-static-onnx/Scripts/python.exe -m pip install --no-index --find-links work/toolchains/s4-static-wheelhouse --require-hashes -r spikes/s4-static-embeddings-requirements-windows.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Hash-required offline wheel install failed' }
+          & work/toolchains/s4-static-onnx/Scripts/python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned isolated dependency validation failed' }
+      - name: Enable Defender protection on this disposable component runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-MpComputerStatus).RealTimeProtectionEnabled) {
+            Set-MpPreference -DisableRealtimeMonitoring $false
+            for ($i = 0; $i -lt 10; $i++) {
+              if ((Get-MpComputerStatus).RealTimeProtectionEnabled) { break }
+              Start-Sleep -Seconds 1
+            }
+          }
+          if (-not (Get-MpComputerStatus).RealTimeProtectionEnabled) { throw 'Defender real-time protection could not be confirmed ON' }
+      - name: Measure sequential FP32 and actual UINT8 under an owned bounded Job
+        shell: pwsh
+        run: |
+          $python = (Resolve-Path work/toolchains/s4-static-onnx/Scripts/python.exe).Path
+          ./spikes/s4-static-windows.ps1 -PythonExecutable $python -ResultDirectory work/static-windows -Threads 4 -TimeoutSeconds 600
+          if ($LASTEXITCODE -ne 0) { throw "Component did not complete or was safely rejected: $LASTEXITCODE" }
+      - name: Log bounded original metadata bytes for verified recovery
+        if: always()
+        shell: pwsh
+        run: |
+          $allowlist = @('windows-supervisor.json', 'supervisor-memory.jsonl', 'measurements/inputs.json', 'measurements/fp32.json', 'measurements/uint8.json', 'measurements/summary.json')
+          foreach ($relative in $allowlist) {
+            $file = Join-Path work/static-windows $relative
+            if (-not (Test-Path -LiteralPath $file)) { continue }
+            $raw = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $file).Path)
+            if ($raw.Length -gt 4194304) { throw 'Metadata file exceeds bounded log recovery limit' }
+            $memory = [IO.MemoryStream]::new()
+            $gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionLevel]::Optimal, $true)
+            $gzip.Write($raw, 0, $raw.Length); $gzip.Dispose()
+            $compressed = $memory.ToArray(); $memory.Dispose()
+            $metadata = [ordered]@{ path = $relative; bytes = $raw.Length;
+              sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($raw)).ToLowerInvariant();
+              compressed_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($compressed)).ToLowerInvariant();
+              classification = 'Original Windows synthetic component metadata; no model weights or user data' }
+            Write-Output ('STATIC_WINDOWS_BEGIN ' + ($metadata | ConvertTo-Json -Compress))
+            $encoded = [Convert]::ToBase64String($compressed)
+            for ($i = 0; $i -lt $encoded.Length; $i += 8192) { Write-Output ('STATIC_WINDOWS_DATA ' + $encoded.Substring($i, [Math]::Min(8192, $encoded.Length - $i))) }
+            Write-Output 'STATIC_WINDOWS_END'
+          }
+      - name: Retain only component metadata and raw timing/memory samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: static-embeddings-windows-component-metadata
+          path: |
+            work/static-windows/windows-supervisor.json
+            work/static-windows/supervisor-memory.jsonl
+            work/static-windows/measurements/inputs.json
+            work/static-windows/measurements/fp32.json
+            work/static-windows/measurements/uint8.json
+            work/static-windows/measurements/summary.json
+          retention-days: 7
+          if-no-files-found: warn

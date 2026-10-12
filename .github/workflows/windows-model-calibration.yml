@@ -1,8 +1,5 @@
 name: Bounded native Windows warm benchmark
 on:
-  push:
-    branches: [bench/windows-dicta-validation]
-    paths: [scripts/bench/windows-model-calibration.ps1, manifests/**, .github/workflows/windows-model-calibration.yml]
   workflow_dispatch:
     inputs:
       probe:
@@ -10,7 +7,7 @@ on:
         required: true
         default: tg128-1500
         type: choice
-        options: [pp500, pp1500, pp3000, tg128, tg128-1500, tg128-3000, full-context, thermal, all]
+        options: [remaining, pp500, pp1500, pp3000, tg128, tg128-1500, tg128-3000, full-context, thermal, all]
       ballast:
         description: Owned ballast GiB; unsafe cases are rejected before model download
         required: true
@@ -27,7 +24,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        probe: ${{ fromJSON(inputs.probe == 'all' && '["pp500","pp1500","pp3000","tg128","tg128-1500","tg128-3000","full-context","thermal"]' || format('["{0}"]', inputs.probe || 'tg128-1500')) }}
+        probe: ${{ fromJSON(inputs.probe == 'remaining' && '["pp3000","full-context","thermal"]' || inputs.probe == 'all' && '["pp500","pp1500","pp3000","tg128","tg128-1500","tg128-3000","full-context","thermal"]' || format('["{0}"]', inputs.probe || 'tg128-1500')) }}
         ballast: ${{ fromJSON(format('[{0}]', inputs.ballast || '0')) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -51,10 +48,17 @@ jobs:
           } catch { $record.error = $_.Exception.Message }
           $record | ConvertTo-Json -Depth 8 | Set-Content work/defender.json -Encoding utf8NoBOM
           $record | ConvertTo-Json -Depth 8 | Write-Output
+      - name: Verify the explicit environment and owned process before model download
+        shell: pwsh
+        run: |
+          ./scripts/bench/windows-model-calibration.ps1 -ProbeOnly -ResultDirectory work/calibration-process-probe
+          if ($LASTEXITCODE -ne 0) { throw 'Tiny owned process and explicit offline environment probe failed' }
+          $report = Get-Content work/calibration-process-probe/run-manifest.json -Raw | ConvertFrom-Json
+          $report.capabilities | ConvertTo-Json -Depth 12 | Write-Output
       - name: Measure selected case within the enforced memory envelope
         shell: pwsh
         run: |
-          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BallastGiB ${{ matrix.ballast }} -TimeoutSeconds 1800 -BenchmarkTimeoutSeconds 18000 -ResultDirectory work/calibration
+          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BallastGiB ${{ matrix.ballast }} -TimeoutSeconds 1800 -BenchmarkTimeoutSeconds $(if ('${{ matrix.probe }}' -eq 'thermal') { 1200 } else { 18000 }) -ResultDirectory work/calibration
           $code = $LASTEXITCODE
           if ($code -eq 2 -and '${{ matrix.ballast }}' -ne '0') {
             $manifest = Get-Content work/calibration/run-manifest.json -Raw | ConvertFrom-Json

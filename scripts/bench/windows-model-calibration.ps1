@@ -235,8 +235,26 @@ namespace KesherCalibration {
    foreach(char c in value) {if(c=='\\') {slashes++;continue;} if(c=='\"') {output.Append('\\',slashes*2+1);output.Append(c);} else {output.Append('\\',slashes);output.Append(c);} slashes=0;}
    output.Append('\\',slashes*2);output.Append('"');return output.ToString();
   }
+  public static string ChildEnvironmentBlock(string executable,string temporaryDirectory,string windowsDirectory) {
+   if(String.IsNullOrWhiteSpace(windowsDirectory)) throw new InvalidOperationException("Cannot determine the Windows system directory for the owned child");
+   string root=Path.GetFullPath(windowsDirectory),system=Path.Combine(root,"System32");
+   var values=new SortedDictionary<string,string>(StringComparer.OrdinalIgnoreCase) {
+    {"SystemRoot",root},{"WINDIR",root},{"SystemDrive",Path.GetPathRoot(root)},{"ComSpec",Path.Combine(system,"cmd.exe")},
+    {"PATH",Path.GetDirectoryName(Path.GetFullPath(executable))+Path.PathSeparator+system+Path.PathSeparator+root},
+    {"TEMP",Path.GetFullPath(temporaryDirectory)},{"TMP",Path.GetFullPath(temporaryDirectory)},
+    {"OS","Windows_NT"},{"NUMBER_OF_PROCESSORS",Environment.ProcessorCount.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+    {"PROCESSOR_ARCHITECTURE","AMD64"},{"HF_HUB_OFFLINE","1"},{"TRANSFORMERS_OFFLINE","1"},
+    {"HF_HUB_DISABLE_TELEMETRY","1"},{"DO_NOT_TRACK","1"}
+   };
+   var block=new StringBuilder();
+   foreach(var value in values) {
+    if(value.Value==null || value.Value.IndexOf('\0')>=0) throw new InvalidOperationException("Invalid owned child environment value");
+    block.Append(value.Key).Append('=').Append(value.Value).Append('\0');
+   }
+   return block.Append('\0').ToString();
+  }
   public static OwnedProcess Start(string executable,string[] arguments,string stdout,string stderr,ulong commitLimit) {
-   var owned=new OwnedProcess();IntPtr input=IntPtr.Zero,output=IntPtr.Zero,error=IntPtr.Zero,list=IntPtr.Zero,handleList=IntPtr.Zero;var info=new ProcessInfo();bool initialized=false,started=false;
+   var owned=new OwnedProcess();IntPtr input=IntPtr.Zero,output=IntPtr.Zero,error=IntPtr.Zero,list=IntPtr.Zero,handleList=IntPtr.Zero,environment=IntPtr.Zero;var info=new ProcessInfo();bool initialized=false,started=false;
    try {
     owned.job=CreateJobObject(IntPtr.Zero,null);if(owned.job==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"Create owned Job");
     var limits=new ExtendedLimits();limits.Basic.Flags=0x2000|0x100|0x8;limits.Basic.ActiveProcesses=1;limits.ProcessMemory=(UIntPtr)commitLimit;
@@ -248,12 +266,14 @@ namespace KesherCalibration {
     Check(UpdateProcThreadAttribute(list,0,new IntPtr(0x20002),handleList,(UIntPtr)(IntPtr.Size*3),IntPtr.Zero,IntPtr.Zero),"Restrict inherited handles to stdio");
     var startup=new StartupEx();startup.Startup.Size=(uint)Marshal.SizeOf<StartupEx>();startup.Startup.Flags=0x100;startup.Startup.Input=input;startup.Startup.Output=output;startup.Startup.Error=error;startup.Attributes=list;
     var command=new StringBuilder(QuoteArgument(executable));foreach(string argument in arguments) command.Append(' ').Append(QuoteArgument(argument));
-    Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,0x4|0x80000|0x08000000,IntPtr.Zero,Path.GetDirectoryName(executable),ref startup,out info),"Create owned child suspended");started=true;
+    string temporaryDirectory=Path.Combine(Path.GetDirectoryName(Path.GetFullPath(stdout)),"native-temp");Directory.CreateDirectory(temporaryDirectory);
+    environment=Marshal.StringToHGlobalUni(ChildEnvironmentBlock(executable,temporaryDirectory,Environment.GetFolderPath(Environment.SpecialFolder.Windows)));
+    Check(CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,0x4|0x400|0x80000|0x08000000,environment,Path.GetDirectoryName(executable),ref startup,out info),"Create owned child suspended with explicit Unicode offline environment");started=true;
     Check(AssignProcessToJobObject(owned.job,info.Process),"Assign suspended child to bounded Job (nested Job must work)");
     if(ResumeThread(info.Thread)==0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error(),"Resume bounded owned child");
     owned.process=info.Process;owned.Pid=info.Pid;info.Process=IntPtr.Zero;return owned;
    } catch {if(started && info.Process!=IntPtr.Zero) TerminateProcess(info.Process,0xbad);owned.Dispose();throw;}
-   finally {if(info.Thread!=IntPtr.Zero) CloseHandle(info.Thread);if(info.Process!=IntPtr.Zero) CloseHandle(info.Process);if(initialized) DeleteProcThreadAttributeList(list);if(list!=IntPtr.Zero) Marshal.FreeHGlobal(list);if(handleList!=IntPtr.Zero) Marshal.FreeHGlobal(handleList);foreach(IntPtr handle in new[]{input,output,error}) if(handle!=IntPtr.Zero && handle!=new IntPtr(-1)) CloseHandle(handle);}
+   finally {if(info.Thread!=IntPtr.Zero) CloseHandle(info.Thread);if(info.Process!=IntPtr.Zero) CloseHandle(info.Process);if(initialized) DeleteProcThreadAttributeList(list);if(list!=IntPtr.Zero) Marshal.FreeHGlobal(list);if(handleList!=IntPtr.Zero) Marshal.FreeHGlobal(handleList);if(environment!=IntPtr.Zero) Marshal.FreeHGlobal(environment);foreach(IntPtr handle in new[]{input,output,error}) if(handle!=IntPtr.Zero && handle!=new IntPtr(-1)) CloseHandle(handle);}
   }
   public bool HasExited {get {uint wait=WaitForSingleObject(process,0);if(wait==0xffffffff) throw new Win32Exception(Marshal.GetLastWin32Error(),"Wait owned child");return wait==0;}}
   public uint ExitCode {get {uint code;Check(GetExitCodeProcess(process,out code),"Get owned child exit code");return code;}}
@@ -418,6 +438,24 @@ function Get-RateSummary([object[]]$Records, [string]$Field) {
         minimum = $values[0]; maximum = $values[$values.Count - 1];
         sample_standard_deviation = if ($values.Count -gt 1) { [Math]::Sqrt($sum / ($values.Count - 1)) } else { $null } }
 }
+function Get-ThermalWindowCounts([object[]]$Arrivals) {
+    # Measure-Object -Property does not resolve OrderedDictionary keys under
+    # strict mode. Sum the actual immutable arrival records without adapting or
+    # changing the two half-open 60-second windows.
+    $firstCount = [long]0; $lastCount = [long]0
+    foreach ($arrival in $Arrivals) {
+        if ($arrival -isnot [Collections.IDictionary] -or -not $arrival.Contains('elapsed_decode_ms') -or
+            -not $arrival.Contains('token_count')) { throw 'Malformed thermal arrival record; no thermal summary accepted.' }
+        $elapsed = [double]$arrival['elapsed_decode_ms']; $count = [double]$arrival['token_count']
+        if (-not [double]::IsFinite($elapsed) -or $elapsed -lt 0 -or -not [double]::IsFinite($count) -or
+            $count -lt 1 -or $count -ne [Math]::Floor($count) -or $count -gt 4095) {
+            throw 'Invalid thermal token count/time; no thermal summary accepted.'
+        }
+        if ($elapsed -lt 60000) { $firstCount += [long]$count }
+        if ($elapsed -ge 240000 -and $elapsed -lt 300000) { $lastCount += [long]$count }
+    }
+    return [ordered]@{ first_minute_tokens = $firstCount; last_minute_tokens = $lastCount }
+}
 function Invoke-ThermalBenchmark([int[]]$Prompt) {
     $script:phase = 'thermal/continuous-decode'
     $request = $null; $response = $null; $reader = $null; $stream = $null; $cancel = $null
@@ -428,7 +466,7 @@ function Invoke-ThermalBenchmark([int[]]$Prompt) {
         if ([KesherCalibration.OwnedProcess]::ListenerPid($port) -ne $ownedChild.Pid) { throw 'Thermal listener is not the owned child.' }
         $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, ($base + '/completion'))
         $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token)
-        $body = @{ prompt = $Prompt; n_predict = 4096 - $Prompt.Count; cache_prompt = $false; stream = $true;
+        $body = @{ prompt = $Prompt; n_predict = 4095 - $Prompt.Count; cache_prompt = $false; stream = $true;
             ignore_eos = $true; temperature = 0; seed = 42; return_tokens = $true; timings_per_token = $false }
         $request.Content = [Net.Http.StringContent]::new(($body | ConvertTo-Json -Depth 12 -Compress), [Text.Encoding]::UTF8, 'application/json')
         $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(600))
@@ -470,8 +508,8 @@ function Invoke-ThermalBenchmark([int[]]$Prompt) {
         if ($null -ne $cancel) { $cancel.Cancel() }
         foreach ($resource in @($reader, $stream, $response, $request, $cancel)) { if ($null -ne $resource) { $resource.Dispose() } }
     }
-    $firstCount = [int](($arrivals | Where-Object { $_.elapsed_decode_ms -lt 60000 } | Measure-Object token_count -Sum).Sum)
-    $lastCount = [int](($arrivals | Where-Object { $_.elapsed_decode_ms -ge 240000 -and $_.elapsed_decode_ms -lt 300000 } | Measure-Object token_count -Sum).Sum)
+    $windowCounts = Get-ThermalWindowCounts $arrivals.ToArray()
+    $firstCount = $windowCounts.first_minute_tokens; $lastCount = $windowCounts.last_minute_tokens
     $record = [ordered]@{ case = 'thermal'; stage = 'summary'; completed_300s_continuous_decode = $completedWindow;
         elapsed_decode_ms = if ($null -ne $thermalWatch) { $thermalWatch.Elapsed.TotalMilliseconds } else { $null };
         first_token_latency_ms = $firstTokenLatencyMs; first_minute_tokens = $firstCount; last_minute_tokens = $lastCount;
@@ -480,7 +518,8 @@ function Invoke-ThermalBenchmark([int[]]$Prompt) {
         last_over_first_minute_rate = if ($completedWindow -and $firstCount -gt 0) { $lastCount / [double]$firstCount } else { $null };
         native_final_timings = $finalTimings; stopped_by_server_before_window = $serverStopped -and -not $completedWindow;
         observation = 'Client token-ID arrival times, 250ms watchdog polling; throughput change does not prove thermal cause';
-        context = 4096; context_shift = $false; prompt_tokens = $Prompt.Count; maximum_generated_tokens = 4096 - $Prompt.Count;
+        context = 4096; context_shift = $false; prompt_tokens = $Prompt.Count; maximum_generated_tokens = 4095 - $Prompt.Count;
+        reserved_context_boundary_tokens = 1;
         quality_claim = $false }
     Write-BenchmarkRecord $record
     if (-not $completedWindow -or $firstCount -eq 0 -or $lastCount -eq 0) { throw 'Continuous thermal window incomplete (possibly reached fixed context limit); no five-minute thermal comparison claimed.' }
@@ -496,7 +535,7 @@ function Invoke-WarmBenchmark {
         if (-not $response.IsSuccessStatusCode) { throw "Tokenize HTTP status $([int]$response.StatusCode)." }
         $tokens = [int[]]((Wait-OwnedTask ($response.Content.ReadAsStringAsync()) | ConvertFrom-Json).tokens)
     } finally { $response.Dispose() }
-    if ($tokens.Count -lt 3968) { throw 'Synthetic tokenize fixture did not provide enough tokens for requested context stress.' }
+    if ($tokens.Count -lt 3967) { throw 'Synthetic tokenize fixture did not provide enough tokens for requested context stress.' }
     $summary = [Collections.Generic.List[object]]::new()
     foreach ($name in $selectedProbes) {
         if ($name -eq 'thermal') {
@@ -506,7 +545,10 @@ function Invoke-WarmBenchmark {
             for ($iteration = 1; $iteration -le $WarmupRuns; $iteration++) { [void](Invoke-NativeBenchmarkCase 'thermal-preparation' $tokens[0..63] 32 'warmup' $iteration) }
             $summary.Add((Invoke-ThermalBenchmark $tokens[0..63])); continue
         }
-        $length = switch ($name) { 'pp500' {500}; 'pp1500' {1500}; 'pp3000' {3000}; 'tg128' {500}; 'tg128-1500' {1500}; 'tg128-3000' {3000}; 'full-context' {3968} }
+        # b11559 marks an exact 4096-token request truncated because its
+        # no-context-shift check reserves the next token boundary. Exercise the
+        # largest untruncated budget (4095) with configured context still4096.
+        $length = switch ($name) { 'pp500' {500}; 'pp1500' {1500}; 'pp3000' {3000}; 'tg128' {500}; 'tg128-1500' {1500}; 'tg128-3000' {3000}; 'full-context' {3967} }
         $predict = if ($name -in @('tg128', 'tg128-1500', 'tg128-3000', 'full-context')) { 128 } else { 1 }
         $prompt = [int[]]$tokens[0..($length - 1)]
         for ($iteration = 1; $iteration -le $WarmupRuns; $iteration++) { [void](Invoke-NativeBenchmarkCase $name $prompt $predict 'warmup' $iteration) }
@@ -514,6 +556,7 @@ function Invoke-WarmBenchmark {
         for ($iteration = 1; $iteration -le $Repetitions; $iteration++) { $measured.Add((Invoke-NativeBenchmarkCase $name $prompt $predict 'measured' $iteration)) }
         $summary.Add([ordered]@{ case = $name; warmup_runs = $WarmupRuns; measured_runs = $measured.Count;
             prompt_tokens = $length; generated_tokens = $predict; context_budget_tokens = $length + $predict;
+            configured_context_tokens = 4096; reserved_context_boundary_tokens = 1;
             prompt_token_ids_sha256 = Get-JsonDigest $prompt;
             prompt_tokens_per_second = Get-RateSummary $measured.ToArray() 'prompt_per_second';
             generation_tokens_per_second = if ($predict -gt 1) { Get-RateSummary $measured.ToArray() 'predicted_per_second' } else { $null } })
@@ -538,8 +581,10 @@ $manifest = [ordered]@{ schema_version = 1; status = 'INITIALIZING'; started_at_
     config = [ordered]@{ context = 4096; parallel = 1; threads = $Threads; batch_threads = $Threads; batch = 512; ubatch = 128;
         cache_k = 'f16'; cache_v = 'f16'; cache_ram_mib = 0; ctx_checkpoints = 0; kv_unified = $true; cache_idle_slots = $false;
         repack = $false; load_mode = 'mmap'; flash_attention = 'off'; gpu_layers = 0; offline = $true;
+        offline_environment_policy = 'Explicit Unicode block: fixed Windows/runtime/temp prerequisites and offline/telemetry guards; no parent credentials, proxies or LLAMA_ARG overrides';
         host = '127.0.0.1'; webui = $false; fixture_max_tokens = 32; fixture_temperature = 0; sample_interval_ms = $sampleIntervalMs };
     safety = [ordered]@{ suspended_before_job_assignment = 'NOT TESTED'; restricted_inherited_handles = 'NOT TESTED';
+        explicit_offline_child_environment = 'NOT TESTED';
         kill_on_close = 'CONFIGURED, cleanup observed separately'; private_commit_limit = 'NOT TESTED'; current_user_only_key_acl = 'NOT TESTED';
         pdh_available_and_pages_input = 'NOT TESTED'; cleanup = 'PENDING' };
     coverage = [ordered]@{ authenticated_local_schema = 'NOT TESTED'; sampled_load_memory = 'NOT TESTED';
@@ -552,6 +597,7 @@ if ($WarmBenchmark) {
         required_prompt_decode_cases = @('pp500', 'pp1500', 'pp3000', 'tg128', 'tg128-1500', 'tg128-3000');
         warmup_runs_per_pp_tg_case = $WarmupRuns; measured_runs_per_pp_tg_case = $Repetitions; ballast_gib = $BallastGiB;
         maximum_owned_process_elapsed_seconds = $BenchmarkTimeoutSeconds; context_shift = $false; cache_prompt = $false;
+        configured_context_tokens = 4096; reserved_context_boundary_tokens = 1; maximum_untruncated_request_budget = 4095;
         thermal_windows = if ('thermal' -in $selectedProbes) {1} else {0};
         thermal_scope = 'One 300-second continuous decode window; not 30 independent thermal windows';
         protocol_document = 'scripts/bench/windows-i3-protocol.md'; cases = @() }
@@ -591,14 +637,17 @@ try {
     [IO.File]::Delete($keyPath); [IO.Directory]::Delete($keyDirectory, $false)
     $keyPath = $null; $keyDirectory = $null
     # A tiny controlled child verifies nested Job assignment even when capacity
-    # rejects model loading. No external source content is read by this child.
+    # rejects model loading. It verifies offline flags and absence of inherited
+    # credential/proxy overrides without emitting environment values.
+    $probeEnvironmentCommand = 'foreach($key in @("HF_HUB_OFFLINE","TRANSFORMERS_OFFLINE","HF_HUB_DISABLE_TELEMETRY","DO_NOT_TRACK")){if([Environment]::GetEnvironmentVariable($key)-ne"1"){exit 81}};foreach($key in @("GITHUB_TOKEN","GH_TOKEN","HF_TOKEN","HUGGING_FACE_HUB_TOKEN","OPENAI_API_KEY","ACTIONS_RUNTIME_TOKEN","ACTIONS_ID_TOKEN_REQUEST_TOKEN","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","LLAMA_ARG_MODEL")){if(-not[string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($key))){exit 82}};[Console]::Out.WriteLine("OFFLINE_ENVIRONMENT_VERIFIED");[Threading.Thread]::Sleep(5000)'
+    $probeOutputPath = Join-Path $ResultDirectory 'job-probe.stdout.log'
     $probe = [KesherCalibration.OwnedProcess]::Start((Join-Path $PSHOME 'pwsh.exe'),
-        [string[]]@('-NoProfile', '-NonInteractive', '-Command', '[Threading.Thread]::Sleep(5000)'),
-        (Join-Path $ResultDirectory 'job-probe.stdout.log'), (Join-Path $ResultDirectory 'job-probe.stderr.log'), [ulong]$privateCommitLimitBytes)
+        [string[]]@('-NoProfile', '-NonInteractive', '-Command', $probeEnvironmentCommand),
+        $probeOutputPath, (Join-Path $ResultDirectory 'job-probe.stderr.log'), [ulong]$privateCommitLimitBytes)
     $probeCleanupSafe = $false
     try {
         $probePeak = [ulong]0; $probeWatch = [Diagnostics.Stopwatch]::StartNew(); $probeSamples = 0
-        while ($probeSamples -lt 2) {
+        while ($probeSamples -lt 2 -or [IO.File]::ReadAllText($probeOutputPath).Trim() -ne 'OFFLINE_ENVIRONMENT_VERIFIED') {
             if ($probeWatch.Elapsed.TotalSeconds -gt 30) { throw 'Tiny owned Job probe exceeded its 30-second deadline; model run remains forbidden.' }
             if ($probe.HasExited) { throw 'Tiny owned Job child exited before controlled Job-close verification.' }
             $probeMemory = $probe.Memory(); $probePeak = [Math]::Max($probePeak, [ulong]$probeMemory['job_peak_private_committed_bytes'])
@@ -609,6 +658,7 @@ try {
         if (-not $probe.HasExited -or $probe.UsedFallbackTermination) { throw 'Tiny bounded Job-close cleanup did not directly stop its owned child; model run remains forbidden.' }
         $manifest.safety.suspended_before_job_assignment = 'MEASURED: tiny owned child successfully assigned while suspended, then resumed'
         $manifest.safety.restricted_inherited_handles = 'MEASURED: child created with explicit stdio-only handle list'
+        $manifest.safety.explicit_offline_child_environment = 'MEASURED on tiny owned Windows child: fixed offline guards present; named credentials/proxies/LLAMA_ARG_MODEL absent; no values logged'
         $manifest.safety.private_commit_limit = 'CONFIGURED 2 GiB and queried on tiny probe; deliberate cap-exhaustion behavior NOT TESTED'
         $manifest.safety.kill_on_close = 'MEASURED: closing owned Job stopped tiny active child; no PID/name scan'
         $manifest.job_probe = [ordered]@{ exit_code_after_controlled_job_close = $probeExit; owned_child_stopped = $true; peak_private_commit_bytes = $probePeak; model_loaded = $false }
@@ -712,7 +762,7 @@ try {
         if (@('pp500', 'pp1500', 'pp3000', 'tg128', 'tg128-1500', 'tg128-3000') | Where-Object { $_ -notin $selectedProbes }) {
             $manifest.coverage.pp500_1500_3000_tg = 'PARTIAL selected cases; pp and tg after all 500/1500/3000 prompt sizes require separately hashed successful jobs before claiming the complete matrix'
         } else { $manifest.coverage.pp500_1500_3000_tg = 'MEASURED pp and tg128 after each 500/1500/3000 prompt size; native counts/cache validated' }
-        if ('full-context' -in $selectedProbes) { $manifest.coverage.full_context_occupancy = 'MEASURED 3968 prompt +128 requested/generated tokens at context4096; native counts/truncation validated' }
+        if ('full-context' -in $selectedProbes) { $manifest.coverage.full_context_occupancy = 'MEASURED 3967 prompt +128 requested/generated tokens (4095 usable budget, one native boundary slot) at configured context4096; exact counts and no truncation required' }
         if ('thermal' -in $selectedProbes) { $manifest.coverage.sustained_5min_thermal = 'MEASURED one continuous 300-second token-ID arrival window; first/last minute comparison, not proof of thermal causation' }
         $manifest.coverage.ballast0_2_4 = "MEASURED selected ballast $BallastGiB GiB only; other admitted matrix cases require separate successful jobs"
         $manifest.coverage.sampled_load_memory = 'MEASURED owned no-repack server load and selected resident-server benchmark; see streamed PDH/private/working-set samples'
