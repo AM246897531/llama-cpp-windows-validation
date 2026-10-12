@@ -312,6 +312,19 @@ function Get-CounterReadiness {
     }
     throw 'Safety prerequisite unavailable: real Available MBytes and Pages Input/sec PDH values are required.'
 }
+function Read-OwnedProbeOutput([string]$Path) {
+    # The owned child still holds its inherited write handle. A Windows reader
+    # must also allow FileShare.Write; File.ReadAllText's default share mode
+    # otherwise fails while the controlled child is alive.
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $reader = $null
+    try {
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
+        return $reader.ReadToEnd().Trim()
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() } else { $stream.Dispose() }
+    }
+}
 function Assert-SampleSafety([long]$Available, [object]$PagesInput, [double]$ElapsedSeconds) {
     if ($Available -lt ($floorBytes + $cancelBufferBytes)) { throw 'EARLY_PRESSURE_CANCEL: available RAM approached reserved 3 GiB floor within 512 MiB.' }
     if ($null -eq $PagesInput) { throw 'Safety prerequisite lost: Pages Input/sec must remain measurable.' }
@@ -647,7 +660,7 @@ try {
     $probeCleanupSafe = $false
     try {
         $probePeak = [ulong]0; $probeWatch = [Diagnostics.Stopwatch]::StartNew(); $probeSamples = 0
-        while ($probeSamples -lt 2 -or [IO.File]::ReadAllText($probeOutputPath).Trim() -ne 'OFFLINE_ENVIRONMENT_VERIFIED') {
+        while ($probeSamples -lt 2 -or (Read-OwnedProbeOutput $probeOutputPath) -ne 'OFFLINE_ENVIRONMENT_VERIFIED') {
             if ($probeWatch.Elapsed.TotalSeconds -gt 30) { throw 'Tiny owned Job probe exceeded its 30-second deadline; model run remains forbidden.' }
             if ($probe.HasExited) { throw 'Tiny owned Job child exited before controlled Job-close verification.' }
             $probeMemory = $probe.Memory(); $probePeak = [Math]::Max($probePeak, [ulong]$probeMemory['job_peak_private_committed_bytes'])
