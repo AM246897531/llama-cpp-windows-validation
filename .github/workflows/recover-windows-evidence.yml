@@ -1,0 +1,51 @@
+name: Recover original Windows calibration evidence
+on:
+  push:
+    branches: [bench/windows-dicta-validation]
+    paths: [.github/workflows/recover-windows-evidence.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retrieve original artifacts without re-running the model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 38224224739 --repo '${{ github.repository }}' --dir recovered
+      - name: Log bounded original memory samples and buffer metadata
+        run: |
+          python3 - <<'PY'
+          import json, hashlib
+          from pathlib import Path
+          directory = Path('recovered/bounded-windows-calibration-metadata')
+          manifest = json.loads((directory/'run-manifest.json').read_text())
+          assert manifest['source_commit'] == 'ee69541eeae0b9bf633600477f9c84c448408c22'
+          assert manifest['status'] == 'MEASURED_PARTIAL' and manifest['artifact_logs_safe']
+          memory = directory/'memory.jsonl'
+          data = memory.read_bytes()
+          assert len(data) <= 2*1024*1024
+          rows = [json.loads(line) for line in data.decode().splitlines() if line.strip()]
+          assert len(rows) == manifest['memory_sample_count']
+          print('ORIGINAL_WINDOWS_JSON_BEGIN memory.jsonl')
+          print(data.decode(), end='')
+          print('ORIGINAL_WINDOWS_JSON_END memory.jsonl')
+          records = {'original_run': 38224224739, 'original_source_commit': manifest['source_commit'],
+              'memory_bytes': len(data), 'memory_rows': len(rows), 'memory_sha256': hashlib.sha256(data).hexdigest(),
+              'recovery_classification': 'Artifact recovery on Linux; all measurements originate in the original Windows run',
+              'native_buffer_lines': []}
+          logs = Path('recovered/bounded-windows-calibration-native-logs')
+          for name in ['native.stdout.log','native.stderr.log']:
+              raw = (logs/name).read_bytes()
+              records[name+'_sha256'] = hashlib.sha256(raw).hexdigest()
+              for line in raw.decode(errors='replace').splitlines():
+                  if any(term in line for term in ['CPU_Mapped','model buffer size','KV buffer size','RS buffer size','compute buffer size']):
+                      records['native_buffer_lines'].append(line)
+          print('ORIGINAL_WINDOWS_JSON_BEGIN integrity.json')
+          print(json.dumps(records, indent=2))
+          print('ORIGINAL_WINDOWS_JSON_END integrity.json')
+          PY
