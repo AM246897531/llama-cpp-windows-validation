@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: Completed Windows calibration run to recover; measurements are never rerun
+        description: Recover finalized Windows artifacts; source run may still be active; measurements are never rerun
         required: false
-        default: '38227197119'
+        default: '38231782896'
         type: string
 permissions:
   contents: read
@@ -22,13 +22,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RECOVERY_REPOSITORY: ${{ github.repository }}
-          RECOVERY_SOURCE_RUN_ID: ${{ inputs.source_run_id || '38227197119' }}
+          RECOVERY_SOURCE_RUN_ID: ${{ inputs.source_run_id || '38231782896' }}
         run: |
           python3 - <<'PY'
           import base64, gzip, hashlib, json, os, re, subprocess
+          from datetime import datetime, timezone
           from pathlib import Path
 
-          # This job only retrieves files from this repository's completed run.
+          # This job only retrieves already uploaded immutable artifacts with a
+          # finalized producer manifest. Other jobs in the source matrix can
+          # remain active for hours; the recovered set is an artifact snapshot.
           # Linux recovery is never a new Windows measurement. No checkout,
           # private source, model download, ephemeral key file or unknown file
           # is needed. A native-log artifact needs its own producer's safety flag.
@@ -65,8 +68,8 @@ jobs:
           run_id = int(run_text)
           run = json.loads(gh('api', f'repos/{repository}/actions/runs/{run_id}'))
           source_commit = run.get('head_sha', '')
-          if run.get('id') != run_id or run.get('status') != 'completed' or not re.fullmatch(r'[a-f0-9]{40}', source_commit):
-              raise ValueError('Source run must be completed and have a full commit SHA')
+          if run.get('id') != run_id or not re.fullmatch(r'[a-f0-9]{40}', source_commit):
+              raise ValueError('Source run identity and full commit SHA must be valid')
           if run.get('repository', {}).get('full_name', '').casefold() != repository.casefold():
               raise ValueError('Source run belongs to a different repository')
           pages = json.loads(gh('api', f'repos/{repository}/actions/runs/{run_id}/artifacts', '--paginate', '--slurp'))
@@ -142,6 +145,17 @@ jobs:
               manifest = json.loads(read_bounded(candidates[0]))
               if manifest.get('schema_version') != 1 or manifest.get('source_commit') != source_commit:
                   raise ValueError('Producer manifest schema or source commit does not match the source run')
+              if manifest.get('status') not in {'MEASURED_PARTIAL', 'FAILED', 'NOT_ADMITTED', 'ADMITTED_FOR_BOUNDED_CALIBRATION'}:
+                  raise ValueError('Producer manifest must have a final calibration status')
+              try:
+                  finished_at = datetime.fromisoformat(manifest['finished_at_utc'].replace('Z', '+00:00'))
+                  started_at = datetime.fromisoformat(manifest['started_at_utc'].replace('Z', '+00:00'))
+                  if finished_at.tzinfo is None or started_at.tzinfo is None or finished_at < started_at:
+                      raise ValueError('Invalid producer completion timestamps')
+                  if (finished_at - datetime.now(timezone.utc)).total_seconds() > 300:
+                      raise ValueError('Producer completion timestamp is in the future')
+              except (KeyError, TypeError, AttributeError, ValueError):
+                  raise ValueError('Producer manifest lacks valid finalized timestamps') from None
               if not isinstance(manifest.get('memory_sample_count'), int) or manifest['memory_sample_count'] < 0:
                   raise ValueError('Producer manifest lacks a valid sample count')
               manifests[name] = manifest
@@ -170,7 +184,8 @@ jobs:
               payloads.append((record, encoded))
           index_sha256 = hashlib.sha256(canonical(index).encode('ascii')).hexdigest()
           summary = {'schema_version': 1, 'source_run_id': run_id, 'source_commit': source_commit,
-                     'classification': 'Linux artifact recovery; all measurements originate in the completed Windows run',
+                     'source_run_status': run.get('status'), 'source_run_complete': run.get('status') == 'completed',
+                     'classification': 'Linux recovery of finalized Windows artifacts; this snapshot does not imply source matrix completion',
                      'file_count': len(index), 'total_bytes': total_bytes, 'index_sha256': index_sha256, 'files': index}
           print('WINDOWS_EVIDENCE_INDEX ' + canonical(summary))
           for record, encoded in payloads:
