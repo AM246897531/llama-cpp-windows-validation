@@ -5,6 +5,13 @@ param(
     [string]$RuntimeDirectory,
     [string]$ModelPath,
     [switch]$ProbeOnly,
+    [switch]$WarmBenchmark,
+    [ValidateNotNullOrEmpty()][ValidateSet('pp500', 'pp1500', 'pp3000', 'tg128', 'full-context', 'thermal')]
+    [string[]]$ProbeSet = @('pp500', 'pp1500', 'pp3000', 'tg128', 'full-context', 'thermal'),
+    [ValidateSet(0, 2, 4)][int]$BallastGiB = 0,
+    [ValidateRange(3, 20)][int]$WarmupRuns = 3,
+    [ValidateRange(30, 120)][int]$Repetitions = 30,
+    [ValidateRange(360, 6900)][int]$BenchmarkTimeoutSeconds = 6900,
     [ValidateRange(1, 128)][int]$Threads = 4,
     [ValidateRange(60, 1800)][int]$TimeoutSeconds = 360,
     [ValidateSet('GITHUB_WINDOWS_RUNNER', 'REPRESENTATIVE_16GB_WINDOWS', 'TARGET_MACHINE')]
@@ -13,6 +20,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($ProbeOnly -and $WarmBenchmark) { throw 'ProbeOnly and WarmBenchmark are mutually exclusive.' }
+if (-not $WarmBenchmark -and ($BallastGiB -ne 0 -or $PSBoundParameters.ContainsKey('ProbeSet') -or
+    $PSBoundParameters.ContainsKey('WarmupRuns') -or $PSBoundParameters.ContainsKey('Repetitions') -or
+    $PSBoundParameters.ContainsKey('BenchmarkTimeoutSeconds'))) { throw 'Benchmark selections require WarmBenchmark; short calibration is preserved.' }
 if (-not $IsWindows -or -not [Environment]::Is64BitProcess -or [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -ne 'X64') {
     throw 'This diagnostic requires real x64 Windows and PowerShell 7.3+. Linux/ARM execution is not Windows x64 evidence.'
 }
@@ -45,6 +56,9 @@ $keyDirectory = $null; $keyPath = $null; $token = $null; $exitCode = 1
 $probeCleanupSafe = $true
 $phase = 'capability-probe'; $watch = [Diagnostics.Stopwatch]::StartNew()
 $pressureSince = $null
+$ballast = $null; $benchmarkWriter = $null
+$effectiveTimeoutSeconds = $TimeoutSeconds
+$selectedProbes = @($ProbeSet | Select-Object -Unique)
 
 function Write-Json([object]$Value, [string]$Path) {
     $Value | ConvertTo-Json -Depth 25 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
@@ -54,14 +68,15 @@ function Get-AvailableMemory {
     $system = Get-CimInstance Win32_OperatingSystem
     return [ordered]@{ available_bytes = [long]$system.FreePhysicalMemory * 1024; total_bytes = [long]$system.TotalVisibleMemorySize * 1024 }
 }
-function Test-Admission([string]$Stage) {
+function Test-Admission([string]$Stage, [long]$AdditionalBallastBytes = 0) {
     $memory = Get-AvailableMemory
-    $ok = $memory.total_bytes -ge $minimumVisibleBytes -and $memory.available_bytes -ge $requiredAvailableBytes
+    $ok = $memory.total_bytes -ge $minimumVisibleBytes -and $memory.available_bytes -ge ($requiredAvailableBytes + $AdditionalBallastBytes)
     $admissions.Add([ordered]@{ stage = $Stage; at_utc = [DateTime]::UtcNow.ToString('o'); admitted = $ok;
         total_bytes = $memory.total_bytes; available_bytes = $memory.available_bytes;
         minimum_visible_bytes = $minimumVisibleBytes; nominal_target_bytes = [long]16GB;
         full_model_mapping_reserved_bytes = [long]$model.bytes; experimental_private_commit_cap_bytes = $privateCommitLimitBytes;
-        floor_bytes = $floorBytes; required_available_bytes = $requiredAvailableBytes;
+        floor_bytes = $floorBytes; required_available_bytes = $requiredAvailableBytes + $AdditionalBallastBytes;
+        additional_ballast_reserved_bytes = $AdditionalBallastBytes;
         overhead_status = 'INITIAL bounded experiment informed by Linux; NOT measured Windows overhead; NOT production admission' })
     return $ok
 }
@@ -91,6 +106,25 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 namespace KesherCalibration {
+ public sealed class Ballast : IDisposable {
+  IntPtr address; readonly ulong bytes;
+  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr VirtualAlloc(IntPtr address,UIntPtr bytes,uint type,uint protection);
+  [DllImport("kernel32.dll",SetLastError=true)] static extern bool VirtualFree(IntPtr address,UIntPtr bytes,uint type);
+  public Ballast(ulong count) {
+   bytes=count;if(count==0) return;
+   address=VirtualAlloc(IntPtr.Zero,(UIntPtr)count,0x2000,0x04);
+   if(address==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"Reserve owned ballast");
+  }
+  public void CommitAndTouch(ulong offset,ulong count) {
+   if(offset>bytes || count>bytes-offset) throw new ArgumentOutOfRangeException("count");
+   IntPtr start=new IntPtr(checked(address.ToInt64()+(long)offset));
+   if(VirtualAlloc(start,(UIntPtr)count,0x1000,0x04)==IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(),"Commit owned ballast chunk");
+   for(ulong page=0;page<count;page+=4096) Marshal.WriteByte(new IntPtr(checked(start.ToInt64()+(long)page)),1);
+  }
+  public void Dispose() {
+   if(address!=IntPtr.Zero) {if(!VirtualFree(address,UIntPtr.Zero,0x8000)) throw new Win32Exception(Marshal.GetLastWin32Error(),"Release owned ballast");address=IntPtr.Zero;}
+  }
+ }
  public sealed class Counters : IDisposable {
   IntPtr query;
   readonly Dictionary<string,IntPtr> handles = new Dictionary<string,IntPtr>();
@@ -232,7 +266,7 @@ function Invoke-Watchdog {
     $samples.Add($snapshot)
     $memoryWriter.WriteLine(($snapshot | ConvertTo-Json -Depth 10 -Compress)); $memoryWriter.Flush()
     Assert-SampleSafety $available $pdh['pages_input_per_sec'] $watch.Elapsed.TotalSeconds
-    if ($watch.Elapsed.TotalSeconds -gt $TimeoutSeconds) { throw 'Calibration exceeded bounded case timeout.' }
+    if ($watch.Elapsed.TotalSeconds -gt $effectiveTimeoutSeconds) { throw 'Calibration/benchmark exceeded bounded case timeout.' }
 }
 function Wait-OwnedTask([object]$Task) {
     while (-not $Task.IsCompleted) { Invoke-Watchdog; Start-Sleep -Milliseconds $sampleIntervalMs }
@@ -278,6 +312,154 @@ function New-PrivateKeyFile([switch]$EmptyProbe) {
     } finally { $identity.Dispose() }
 }
 
+function Get-JsonDigest([object]$Value) {
+    $json = ConvertTo-Json -InputObject $Value -Depth 15 -Compress
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($json))).ToLowerInvariant()
+}
+function Write-BenchmarkRecord([object]$Record) {
+    $benchmarkWriter.WriteLine(($Record | ConvertTo-Json -Depth 15 -Compress)); $benchmarkWriter.Flush()
+}
+function Invoke-NativeBenchmarkCase([string]$Name, [int[]]$Prompt, [int]$Predict, [string]$Stage, [int]$Iteration) {
+    $script:phase = "$Name/$Stage/$Iteration"
+    $request = @{ prompt = $Prompt; n_predict = $Predict; cache_prompt = $false; stream = $false;
+        ignore_eos = $true; temperature = 0; seed = 42; return_tokens = $true }
+    $caseWatch = [Diagnostics.Stopwatch]::StartNew()
+    $firstSample = $samples.Count
+    $response = Invoke-LocalRequest '/completion' $true $request $TimeoutSeconds
+    try {
+        if (-not $response.IsSuccessStatusCode) { throw "Native benchmark HTTP status $([int]$response.StatusCode)." }
+        $body = (Wait-OwnedTask ($response.Content.ReadAsStringAsync())) | ConvertFrom-Json
+    } finally { $response.Dispose() }
+    $timings = $body.timings
+    $valid = [int]$timings.prompt_n -eq $Prompt.Count -and [int]$timings.predicted_n -eq $Predict -and
+        [int]$timings.cache_n -eq 0 -and -not [bool]$body.truncated -and
+        [double]$timings.prompt_ms -gt 0 -and [double]$timings.prompt_per_second -gt 0 -and
+        ($Predict -eq 1 -or ([double]$timings.predicted_ms -gt 0 -and [double]$timings.predicted_per_second -gt 0))
+    $record = [ordered]@{ case = $Name; stage = $Stage; iteration = $Iteration; validated = $valid;
+        prompt_tokens = $Prompt.Count; requested_generation_tokens = $Predict; prompt_token_ids_sha256 = Get-JsonDigest $Prompt;
+        native_timings = $timings; truncated = [bool]$body.truncated; stop_type = $body.stop_type;
+        request_elapsed_ms = $caseWatch.Elapsed.TotalMilliseconds; first_memory_sample = $firstSample;
+        after_memory_sample = $samples.Count; cold_warm = 'warm-only; resident server, uncontrolled filesystem cache';
+        cache_prompt = $false; generation_throughput_interpretable = $Predict -gt 1; quality_claim = $false }
+    Write-BenchmarkRecord $record
+    if (-not $valid) { throw "Native $Name counts/cache/timings were inconsistent with the selected case; raw timing record retained." }
+    return $record
+}
+function Get-RateSummary([object[]]$Records, [string]$Field) {
+    $values = @($Records | ForEach-Object { [double]$_.native_timings.$Field } | Sort-Object)
+    if (-not $values.Count) { return $null }
+    $mean = [double](($values | Measure-Object -Average).Average)
+    $sum = 0.0; foreach ($value in $values) { $sum += [Math]::Pow($value - $mean, 2) }
+    $middle = [int][Math]::Floor($values.Count / 2)
+    $median = if ($values.Count % 2) { $values[$middle] } else { ($values[$middle - 1] + $values[$middle]) / 2 }
+    return [ordered]@{ count = $values.Count; mean = $mean; median = $median;
+        p95 = $values[[Math]::Max(0, [int][Math]::Ceiling(0.95 * $values.Count) - 1)];
+        minimum = $values[0]; maximum = $values[$values.Count - 1];
+        sample_standard_deviation = if ($values.Count -gt 1) { [Math]::Sqrt($sum / ($values.Count - 1)) } else { $null } }
+}
+function Invoke-ThermalBenchmark([int[]]$Prompt) {
+    $script:phase = 'thermal/continuous-decode'
+    $request = $null; $response = $null; $reader = $null; $stream = $null; $cancel = $null
+    $arrivals = [Collections.Generic.List[object]]::new()
+    $thermalWatch = $null; $firstTokenLatencyMs = $null; $requestWatch = [Diagnostics.Stopwatch]::StartNew()
+    $completedWindow = $false; $serverStopped = $false; $finalTimings = $null
+    try {
+        if ([KesherCalibration.OwnedProcess]::ListenerPid($port) -ne $ownedChild.Pid) { throw 'Thermal listener is not the owned child.' }
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, ($base + '/completion'))
+        $request.Headers.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $token)
+        $body = @{ prompt = $Prompt; n_predict = 4096 - $Prompt.Count; cache_prompt = $false; stream = $true;
+            ignore_eos = $true; temperature = 0; seed = 42; return_tokens = $true; timings_per_token = $false }
+        $request.Content = [Net.Http.StringContent]::new(($body | ConvertTo-Json -Depth 12 -Compress), [Text.Encoding]::UTF8, 'application/json')
+        $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(600))
+        $response = Wait-OwnedTask ($http.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancel.Token))
+        if (-not $response.IsSuccessStatusCode) { throw "Thermal HTTP status $([int]$response.StatusCode)." }
+        $stream = Wait-OwnedTask ($response.Content.ReadAsStreamAsync())
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
+        while (-not $serverStopped -and -not $completedWindow) {
+            $lineTask = $reader.ReadLineAsync()
+            while (-not $lineTask.IsCompleted) {
+                Invoke-Watchdog
+                if ($requestWatch.Elapsed.TotalSeconds -gt 600) { throw 'Thermal stream exceeded its 600-second request deadline.' }
+                if ($null -ne $thermalWatch -and $thermalWatch.Elapsed.TotalSeconds -ge 300) { $completedWindow = $true; break }
+                Start-Sleep -Milliseconds $sampleIntervalMs
+            }
+            if ($completedWindow) { break }
+            Invoke-Watchdog
+            $line = $lineTask.GetAwaiter().GetResult()
+            if ($null -eq $line) { $serverStopped = $true; break }
+            if (-not $line.StartsWith('data: ')) { continue }
+            $payload = $line.Substring(6)
+            if ($payload -eq '[DONE]') { $serverStopped = $true; break }
+            $event = $payload | ConvertFrom-Json
+            if ($null -ne $thermalWatch -and $thermalWatch.Elapsed.TotalSeconds -ge 300) { $completedWindow = $true; break }
+            if ($event.PSObject.Properties['error']) { throw 'Native thermal stream reported an error.' }
+            if ($event.PSObject.Properties['stop'] -and $event.stop) {
+                $serverStopped = $true
+                if ($event.PSObject.Properties['timings']) { $finalTimings = $event.timings }
+                break
+            }
+            if ($event.PSObject.Properties['tokens'] -and @($event.tokens).Count -gt 0) {
+                if ($null -eq $thermalWatch) { $firstTokenLatencyMs = $requestWatch.Elapsed.TotalMilliseconds; $thermalWatch = [Diagnostics.Stopwatch]::StartNew() }
+                $arrival = [ordered]@{ elapsed_decode_ms = $thermalWatch.Elapsed.TotalMilliseconds; token_count = @($event.tokens).Count }
+                $arrivals.Add($arrival)
+                Write-BenchmarkRecord ([ordered]@{ case = 'thermal'; stage = 'token-arrival'; elapsed_decode_ms = $arrival.elapsed_decode_ms; token_count = $arrival.token_count })
+            }
+        }
+    } finally {
+        if ($null -ne $cancel) { $cancel.Cancel() }
+        foreach ($resource in @($reader, $stream, $response, $request, $cancel)) { if ($null -ne $resource) { $resource.Dispose() } }
+    }
+    $firstCount = [int](($arrivals | Where-Object { $_.elapsed_decode_ms -lt 60000 } | Measure-Object token_count -Sum).Sum)
+    $lastCount = [int](($arrivals | Where-Object { $_.elapsed_decode_ms -ge 240000 -and $_.elapsed_decode_ms -lt 300000 } | Measure-Object token_count -Sum).Sum)
+    $record = [ordered]@{ case = 'thermal'; stage = 'summary'; completed_300s_continuous_decode = $completedWindow;
+        elapsed_decode_ms = if ($null -ne $thermalWatch) { $thermalWatch.Elapsed.TotalMilliseconds } else { $null };
+        first_token_latency_ms = $firstTokenLatencyMs; first_minute_tokens = $firstCount; last_minute_tokens = $lastCount;
+        first_minute_client_arrival_tokens_per_second = if ($completedWindow) { $firstCount / 60.0 } else { $null };
+        last_minute_client_arrival_tokens_per_second = if ($completedWindow) { $lastCount / 60.0 } else { $null };
+        last_over_first_minute_rate = if ($completedWindow -and $firstCount -gt 0) { $lastCount / [double]$firstCount } else { $null };
+        native_final_timings = $finalTimings; stopped_by_server_before_window = $serverStopped -and -not $completedWindow;
+        observation = 'Client token-ID arrival times, 250ms watchdog polling; throughput change does not prove thermal cause';
+        context = 4096; context_shift = $false; prompt_tokens = $Prompt.Count; maximum_generated_tokens = 4096 - $Prompt.Count;
+        quality_claim = $false }
+    Write-BenchmarkRecord $record
+    if (-not $completedWindow -or $firstCount -eq 0 -or $lastCount -eq 0) { throw 'Continuous thermal window incomplete (possibly reached fixed context limit); no five-minute thermal comparison claimed.' }
+    return $record
+}
+function Invoke-WarmBenchmark {
+    $script:effectiveTimeoutSeconds = $BenchmarkTimeoutSeconds
+    $script:phase = 'benchmark/tokenize'
+    $script:benchmarkWriter = [IO.StreamWriter]::new((Join-Path $ResultDirectory 'benchmark.jsonl'), $false, [Text.UTF8Encoding]::new($false))
+    $text = ('Reference entry: measured token processing preserves the complete model and original context. ' * 1024)
+    $response = Invoke-LocalRequest '/tokenize' $true @{ content = $text; add_special = $true; parse_special = $false; with_pieces = $false }
+    try {
+        if (-not $response.IsSuccessStatusCode) { throw "Tokenize HTTP status $([int]$response.StatusCode)." }
+        $tokens = [int[]]((Wait-OwnedTask ($response.Content.ReadAsStringAsync()) | ConvertFrom-Json).tokens)
+    } finally { $response.Dispose() }
+    if ($tokens.Count -lt 3968) { throw 'Synthetic tokenize fixture did not provide enough tokens for requested context stress.' }
+    $summary = [Collections.Generic.List[object]]::new()
+    foreach ($name in $selectedProbes) {
+        if ($name -eq 'thermal') {
+            # Thermal covers a single sustained window rather than pretending to
+            # provide 30 independent five-minute windows. Explicit short warmups
+            # run first; timing distributions belong to the selected pp/tg cases.
+            for ($iteration = 1; $iteration -le $WarmupRuns; $iteration++) { [void](Invoke-NativeBenchmarkCase 'thermal-preparation' $tokens[0..63] 32 'warmup' $iteration) }
+            $summary.Add((Invoke-ThermalBenchmark $tokens[0..63])); continue
+        }
+        $length = switch ($name) { 'pp500' {500}; 'pp1500' {1500}; 'pp3000' {3000}; 'tg128' {500}; 'full-context' {3968} }
+        $predict = if ($name -in @('tg128', 'full-context')) { 128 } else { 1 }
+        $prompt = [int[]]$tokens[0..($length - 1)]
+        for ($iteration = 1; $iteration -le $WarmupRuns; $iteration++) { [void](Invoke-NativeBenchmarkCase $name $prompt $predict 'warmup' $iteration) }
+        $measured = [Collections.Generic.List[object]]::new()
+        for ($iteration = 1; $iteration -le $Repetitions; $iteration++) { $measured.Add((Invoke-NativeBenchmarkCase $name $prompt $predict 'measured' $iteration)) }
+        $summary.Add([ordered]@{ case = $name; warmup_runs = $WarmupRuns; measured_runs = $measured.Count;
+            prompt_tokens = $length; generated_tokens = $predict; context_budget_tokens = $length + $predict;
+            prompt_token_ids_sha256 = Get-JsonDigest $prompt;
+            prompt_tokens_per_second = Get-RateSummary $measured.ToArray() 'prompt_per_second';
+            generation_tokens_per_second = if ($predict -gt 1) { Get-RateSummary $measured.ToArray() 'predicted_per_second' } else { $null } })
+    }
+    return $summary.ToArray()
+}
+
 $manifest = [ordered]@{ schema_version = 1; status = 'INITIALIZING'; started_at_utc = [DateTime]::UtcNow.ToString('o');
     execution_environment = $ExecutionEnvironment; classification = 'WINDOWS CAPABILITY PROBE — NO MODEL LOADED';
     production_adoption = $false; target_16gb = 'NOT MEASURED ON TARGET 16GB MACHINE';
@@ -285,6 +467,7 @@ $manifest = [ordered]@{ schema_version = 1; status = 'INITIALIZING'; started_at_
     probe_only = [bool]$ProbeOnly; artifact_logs_safe = $false; source_commit = 'NOT AVAILABLE'; script_sha256 = Get-Sha256 $PSCommandPath;
     model_manifest_sha256 = Get-Sha256 $modelManifestPath; runtime_manifest_sha256 = Get-Sha256 $runtimeManifestPath;
     model_repository = $model.repository; model_revision = $model.revision; model_sha256 = $model.sha256; model_bytes = $model.bytes;
+    model_filename = $model.filename; model_quantization = 'Q4_K_M';
     runtime_release = $runtime.release; runtime_source_commit = $runtime.commit;
     rationale = 'Linux same-model c4096 no-repack peak 7893659648 bytes motivates bounded Windows calibration; NOT Windows overhead proof';
     budgets = [ordered]@{ full_mapping_reserved_bytes = [long]$model.bytes; initial_private_commit_cap_bytes = $privateCommitLimitBytes;
@@ -303,6 +486,15 @@ $manifest = [ordered]@{ schema_version = 1; status = 'INITIALIZING'; started_at_
         ballast0_2_4 = 'NOT TESTED'; sustained_5min_thermal = 'NOT TESTED'; cold_reboot_purge = 'NOT TESTED';
         power_ac_battery_matrix = 'NOT TESTED'; production_flag_performance_quality = 'NOT TESTED'; full_I3 = 'NOT VALIDATED' };
     admissions = $admissions }
+if ($WarmBenchmark) {
+    $manifest.benchmark = [ordered]@{ mode = 'resident server warm benchmark'; selected_probes = $selectedProbes;
+        warmup_runs_per_pp_tg_case = $WarmupRuns; measured_runs_per_pp_tg_case = $Repetitions; ballast_gib = $BallastGiB;
+        maximum_owned_process_elapsed_seconds = $BenchmarkTimeoutSeconds; context_shift = $false; cache_prompt = $false;
+        thermal_windows = if ('thermal' -in $selectedProbes) {1} else {0};
+        thermal_scope = 'One 300-second continuous decode window; not 30 independent thermal windows';
+        protocol_document = 'scripts/bench/windows-i3-protocol.md'; cases = @() }
+    $manifest.benchmark_config_sha256 = Get-JsonDigest $manifest.benchmark
+}
 
 try {
     if ($runtime.release -ne 'b11559' -or $runtime.commit -ne 'f2cc7282ce0042641df55e0e563b75e824e2b647' -or
@@ -327,7 +519,7 @@ try {
     catch { $manifest.defender = [ordered]@{ status = 'NOT TESTED'; realtime_enabled = $null; settings_changed = $false } }
     $configJson = $manifest.config | ConvertTo-Json -Depth 12 -Compress
     $manifest.config_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($configJson))).ToLowerInvariant()
-    $initialAdmission = Test-Admission 'initial capability probe before downloads or model load'
+    $initialAdmission = Test-Admission 'initial capability probe before downloads or model load' ([long]$BallastGiB * 1GB)
     $counters = [KesherCalibration.Counters]::new()
     $ready = Get-CounterReadiness
     $manifest.safety.pdh_available_and_pages_input = 'MEASURED: real English PDH gauges available; no zero-fill fallback'
@@ -373,6 +565,20 @@ try {
     if ($executables.Count -ne 1) { throw 'Verified runtime archive must contain exactly one llama-server.exe.' }
     $executable = $executables[0].FullName
     $manifest.native_binary_sha256 = Get-Sha256 $executable; $manifest.native_archive_sha256 = Get-Sha256 $archive
+    if ($WarmBenchmark -and $BallastGiB -gt 0) {
+        if (-not (Test-Admission 'before owned ballast reservation and page touch' ([long]$BallastGiB * 1GB))) { $manifest.status = 'NOT_ADMITTED'; $exitCode = 2; return }
+        $ballast = [KesherCalibration.Ballast]::new([ulong]$BallastGiB * 1GB)
+        $ballastWatch = [Diagnostics.Stopwatch]::StartNew()
+        for ($offset = [long]0; $offset -lt ([long]$BallastGiB * 1GB); $offset += 64MB) {
+            $ready = $counters.Sample()
+            if (-not $ready.ContainsKey('available_mib') -or $null -eq $ready['available_mib'] -or
+                -not $ready.ContainsKey('pages_input_per_sec') -or $null -eq $ready['pages_input_per_sec']) { throw 'Required PDH gauges unavailable during ballast touch.' }
+            Assert-SampleSafety ([long]($ready['available_mib'] * 1MB)) $ready['pages_input_per_sec'] $ballastWatch.Elapsed.TotalSeconds
+            $ballast.CommitAndTouch([ulong]$offset, [ulong]64MB)
+        }
+        $manifest.benchmark.ballast_bytes_committed_and_touched = [long]$BallastGiB * 1GB
+        $pressureSince = $null
+    }
     if (-not (Test-Admission 'immediately before bounded model child')) { $manifest.status = 'NOT_ADMITTED'; $exitCode = 2; return }
     New-PrivateKeyFile
     $manifest.safety.current_user_only_key_acl = 'MEASURED: protected current-user-only parent ACL and verified key inheritance; 256-bit random ephemeral key'
@@ -383,6 +589,7 @@ try {
         '--no-webui', '--offline', '-ngl', '0', '-t', [string]$Threads, '-tb', [string]$Threads, '-c', '4096', '-np', '1',
         '-b', '512', '-ub', '128', '--cache-ram', '0', '--ctx-checkpoints', '0', '--kv-unified', '--no-cache-idle-slots',
         '--load-mode', 'mmap', '-ctk', 'f16', '-ctv', 'f16', '-fa', 'off', '--no-repack', '--verbosity', '4')
+    if ($WarmBenchmark) { $arguments += '--no-context-shift' }
     $manifest.native_flags = @($arguments | ForEach-Object { if ($_ -eq $keyPath) { '<ephemeral-api-key-file>' } else { $_ } })
     $memoryWriter = [IO.StreamWriter]::new((Join-Path $ResultDirectory 'memory.jsonl'), $false, [Text.UTF8Encoding]::new($false))
     $handler = [Net.Http.HttpClientHandler]::new(); $handler.UseProxy = $false
@@ -435,6 +642,19 @@ try {
     $manifest.memory_after_fixture = $samples[$samples.Count - 1]
     $manifest.coverage.authenticated_local_schema = 'MEASURED single synthetic structural fixture; not answer quality'
     $manifest.coverage.sampled_load_memory = 'MEASURED single no-repack server process; partial sampling; not full-context stress or throughput'
+    if ($WarmBenchmark) {
+        $manifest.benchmark.cases = @(Invoke-WarmBenchmark)
+        $manifest.benchmark.defender_realtime_requirement_met = $manifest.defender.status -eq 'MEASURED' -and $manifest.defender.realtime_enabled -eq $true
+        $manifest.benchmark.performance_conditions_scope = 'Defender real-time observed only; cold/power/AC-battery/consumer-target conditions remain unvalidated'
+        $manifest.coverage.three_warmups_thirty_samples = 'MEASURED on each selected pp/tg/full-context case; see case counts; thermal is one continuous window'
+        if (@('pp500', 'pp1500', 'pp3000', 'tg128') | Where-Object { $_ -notin $selectedProbes }) {
+            $manifest.coverage.pp500_1500_3000_tg = 'PARTIAL selected cases; combine separately hashed successful jobs before claiming the complete matrix'
+        } else { $manifest.coverage.pp500_1500_3000_tg = 'MEASURED selected complete prompt/decode matrix; native counts/cache validated' }
+        if ('full-context' -in $selectedProbes) { $manifest.coverage.full_context_occupancy = 'MEASURED 3968 prompt +128 requested/generated tokens at context4096; native counts/truncation validated' }
+        if ('thermal' -in $selectedProbes) { $manifest.coverage.sustained_5min_thermal = 'MEASURED one continuous 300-second token-ID arrival window; first/last minute comparison, not proof of thermal causation' }
+        $manifest.coverage.ballast0_2_4 = "MEASURED selected ballast $BallastGiB GiB only; other admitted matrix cases require separate successful jobs"
+        $manifest.coverage.sampled_load_memory = 'MEASURED owned no-repack server load and selected resident-server benchmark; see streamed PDH/private/working-set samples'
+    }
     $manifest.classification = 'MEASURED PARTIAL ON WINDOWS CLOUD HARDWARE — NOT TARGET 16GB PROOF'
     $manifest.status = 'MEASURED_PARTIAL'; $exitCode = 0
 } catch {
@@ -448,7 +668,7 @@ try {
         catch { $manifest.owned_child_stopped = $false; $manifest.status = 'FAILED'; $exitCode = 1; $cleanupSafe = $false }
         finally { try { $ownedChild.Dispose() } catch { $manifest.owned_child_stopped = $false; $manifest.status = 'FAILED'; $exitCode = 1; $cleanupSafe = $false }; $ownedChild = $null }
     }
-    foreach ($resource in @($memoryWriter, $http, $counters)) {
+    foreach ($resource in @($memoryWriter, $benchmarkWriter, $http, $counters, $ballast)) {
         if ($null -ne $resource) { try { $resource.Dispose() } catch { $manifest.status = 'FAILED'; $exitCode = 1; $cleanupSafe = $false } }
     }
     $redacted = $false

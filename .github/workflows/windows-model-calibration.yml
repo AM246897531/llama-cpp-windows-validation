@@ -1,4 +1,4 @@
-name: Bounded native Windows model calibration
+name: Bounded native Windows warm benchmark
 on:
   push:
     branches: [bench/windows-dicta-validation]
@@ -7,16 +7,41 @@ on:
 permissions:
   contents: read
 jobs:
-  calibration:
+  warm-benchmark:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        probe: [pp500, full-context]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Calibrate within the enforced memory envelope
+      - name: Enable Defender real-time protection for this disposable benchmark runner
         shell: pwsh
         run: |
-          ./scripts/bench/windows-model-calibration.ps1 -ResultDirectory work/calibration
-          if ($LASTEXITCODE -ne 0) { throw "Bounded calibration did not complete: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force work | Out-Null
+          $record = [ordered]@{ status = 'NOT VALIDATED'; setting_changes = @(); error = $null }
+          try {
+            $record.before = [bool](Get-MpComputerStatus).RealTimeProtectionEnabled
+            if (-not $record.before) {
+              Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
+              $record.setting_changes += 'Requested real-time protection ON; never disabled security'
+              for ($i = 0; $i -lt 10; $i++) {
+                if ((Get-MpComputerStatus).RealTimeProtectionEnabled) { break }
+                Start-Sleep -Seconds 1
+              }
+            }
+            $record.after = [bool](Get-MpComputerStatus).RealTimeProtectionEnabled
+            if ($record.after) { $record.status = 'MEASURED Defender real-time ON' }
+          } catch { $record.error = $_.Exception.Message }
+          $record | ConvertTo-Json -Depth 8 | Set-Content work/defender.json -Encoding utf8NoBOM
+          $record | ConvertTo-Json -Depth 8 | Write-Output
+      - name: Measure selected case within the enforced memory envelope
+        shell: pwsh
+        run: |
+          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BenchmarkTimeoutSeconds 6600 -ResultDirectory work/calibration
+          if ($LASTEXITCODE -ne 0) { throw "Selected benchmark did not complete: $LASTEXITCODE" }
       - name: Log capability manifest
         if: always()
         shell: pwsh
@@ -30,10 +55,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: bounded-windows-calibration-metadata
+          name: bounded-windows-benchmark-${{ matrix.probe }}-metadata
           path: |
             work/calibration/run-manifest.json
             work/calibration/memory.jsonl
+            work/calibration/benchmark.jsonl
+            work/defender.json
           retention-days: 7
           if-no-files-found: warn
       - name: Check logs are safe to retain
@@ -49,7 +76,7 @@ jobs:
         if: always() && steps.safe-logs.outputs.safe == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: bounded-windows-calibration-native-logs
+          name: bounded-windows-benchmark-${{ matrix.probe }}-native-logs
           path: |
             work/calibration/native.stdout.log
             work/calibration/native.stderr.log
