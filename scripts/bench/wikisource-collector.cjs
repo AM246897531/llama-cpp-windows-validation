@@ -1,6 +1,6 @@
 'use strict';
 const crypto=require('node:crypto');const https=require('node:https');const assert=require('node:assert/strict');
-const GENRES=["modern_hebrew","mishnah","gemara","rishonim","poskim"];const WIKI_SOURCES=[{"genre":"mishnah","title":"משנה ברכות א","author":"Mishnah, ancient collective authorship"},{"genre":"mishnah","title":"משנה פאה א","author":"Mishnah, ancient collective authorship"},{"genre":"gemara","title":"ברכות ב א","author":"Babylonian Talmud, ancient collective authorship"},{"genre":"gemara","title":"ברכות ב ב","author":"Babylonian Talmud, ancient collective authorship"},{"genre":"gemara","title":"ברכות ג א","author":"Babylonian Talmud, ancient collective authorship"},{"genre":"rishonim","title":"רמב\"ם הלכות תלמוד תורה פרק א","author":"Moses Maimonides (1138–1204)"},{"genre":"rishonim","title":"רמב\"ם הלכות תשובה פרק א","author":"Moses Maimonides (1138–1204)"},{"genre":"poskim","title":"שולחן ערוך אורח חיים א","author":"Joseph Karo (1488–1575); Moses Isserles (1530–1572)"},{"genre":"poskim","title":"שולחן ערוך אורח חיים ב","author":"Joseph Karo (1488–1575); Moses Isserles (1530–1572)"},{"genre":"poskim","title":"שולחן ערוך אורח חיים ג","author":"Joseph Karo (1488–1575); Moses Isserles (1530–1572)"}];
+const GENRES=["modern_hebrew","mishnah","gemara","rishonim","poskim"];const WIKI_SOURCES=[{"genre":"mishnah","title":"משנה ברכות א","author":"Mishnah, ancient collective authorship"},{"genre":"mishnah","title":"משנה פאה א","author":"Mishnah, ancient collective authorship"},{"genre":"gemara","title":"ברכות ב א","author":"Babylonian Talmud, ancient collective authorship"},{"genre":"gemara","title":"ברכות ב ב","author":"Babylonian Talmud, ancient collective authorship"},{"genre":"gemara","title":"ברכות ג א","author":"Babylonian Talmud, ancient collective authorship"},{"genre":"rishonim","title":"רמב\"ם הלכות תלמוד תורה א","title_candidates":["רמב\"ם הלכות תלמוד תורה א","רמב\"ם הלכות תלמוד תורה פרק א"],"author":"Moses Maimonides (1138–1204)"},{"genre":"rishonim","title":"רמב\"ם הלכות תשובה א","title_candidates":["רמב\"ם הלכות תשובה א","רמב\"ם הלכות תשובה פרק א"],"author":"Moses Maimonides (1138–1204)"},{"genre":"poskim","title":"שולחן ערוך אורח חיים א","author":"Joseph Karo (1488–1575); Moses Isserles (1530–1572)"},{"genre":"poskim","title":"שולחן ערוך אורח חיים ב","author":"Joseph Karo (1488–1575); Moses Isserles (1530–1572)"},{"genre":"poskim","title":"שולחן ערוך אורח חיים ג","author":"Joseph Karo (1488–1575); Moses Isserles (1530–1572)"}];
 const sha256=value => crypto.createHash('sha256').update(value).digest('hex');const WIKI_USER_AGENT="AncientTextReviewBot/1.0 (+https://github.com/AM246897531/llama-cpp-windows-validation; small serial licensed research corpus)";
 function wikiUrl(parameters) {
   const url = new URL('https://he.wikisource.org/w/api.php');
@@ -95,12 +95,45 @@ function verifyWikiLicense(siteinfo) {
   assert.equal(siteinfo.query?.general?.wikiid, 'hewikisource', 'Unexpected wiki publisher');
   return { id: 'CC-BY-SA-4.0', url, text: rights.text, publisher: 'Hebrew Wikisource / Wikimedia contributors' };
 }
+async function resolveWikiSources(sources, fetchJson, budget) {
+  const titles = [...new Set(sources.flatMap(source => source.title_candidates ?? [source.title]))];
+  assert.ok(titles.length > 0 && titles.length <= 40 && titles.every(title => typeof title === 'string' && title && !title.includes('|')), 'Invalid explicit source title list');
+  const response = await fetchJson(wikiUrl({ action: 'query', prop: 'info|pageprops', titles: titles.join('|'), redirects: '1' }), budget);
+  const query = response.data.query;
+  assert.ok(Array.isArray(query?.pages), 'Missing official source title metadata');
+  const mappings = new Map([...(query.normalized ?? []), ...(query.redirects ?? [])].map(item => [item.from, item.to]));
+  const resolveTitle = title => {
+    const seen = new Set();
+    while (mappings.has(title)) { assert.ok(!seen.has(title) && seen.size < 10, 'Cyclic official title redirect'); seen.add(title); title = mappings.get(title); }
+    return title;
+  };
+  return sources.map(source => {
+    const candidates = source.title_candidates ?? [source.title];
+    const candidate = candidates.map(title => ({ title, page: query.pages.find(page => page.title === resolveTitle(title)) }))
+      .find(item => item.page?.ns === 0 && !item.page.missing && item.page.pageid > 0 && !Object.hasOwn(item.page.pageprops ?? {}, 'disambiguation'));
+    assert.ok(candidate, `Missing original-source title before content download: action=query; exact candidates=${JSON.stringify(candidates)}`);
+    return { ...source, title: candidate.title, original_requested_title: source.title, resolved_title: candidate.page.title,
+      resolved_page_id: candidate.page.pageid, title_resolution_sha256: response.sha256 };
+  });
+}
+async function probeWikiTitles() {
+  const budget = { used: 0 };
+  const site = await requestJson(wikiUrl({ action: 'query', meta: 'siteinfo', siprop: 'general|rightsinfo' }), budget);
+  const license = verifyWikiLicense(site.data);
+  const sources = await resolveWikiSources(WIKI_SOURCES, requestJson, budget);
+  return { classification: 'OFFICIAL TITLE METADATA ONLY / NO TEXT DOWNLOADED', license,
+    downloaded_bytes: budget.used, siteinfo_sha256: site.sha256,
+    sources: sources.map(source => ({ genre: source.genre, requested_title: source.original_requested_title,
+      exact_candidate: source.title, canonical_title: source.resolved_title, namespace: 0, page_id: source.resolved_page_id,
+      title_resolution_sha256: source.title_resolution_sha256 })) };
+}
 async function collectWiki({ fetchJson = requestJson, sources = WIKI_SOURCES } = {}) {
   const budget = { used: 0 };
   const site = await fetchJson(wikiUrl({ action: 'query', meta: 'siteinfo', siprop: 'general|rightsinfo' }), budget);
   const license = verifyWikiLicense(site.data);
   const rows = [];
-  for (const source of sources) {
+  const resolvedSources = await resolveWikiSources(sources, fetchJson, budget);
+  for (const source of resolvedSources) {
     assert.ok(GENRES.includes(source.genre) && source.genre !== 'modern_hebrew', 'Unexpected corpus genre');
     const response = await fetchJson(wikiUrl({ action: 'query', prop: 'revisions', titles: source.title,
       redirects: '1', rvprop: 'ids|timestamp|user|content', rvslots: 'main' }), budget);
@@ -108,6 +141,8 @@ async function collectWiki({ fetchJson = requestJson, sources = WIKI_SOURCES } =
     assert.ok(Array.isArray(pages) && pages.length === 1, 'Expected exactly one original-source page');
     const page = pages[0], revision = page.revisions?.[0], slot = revision?.slots?.main;
     assert.ok(page.ns === 0 && !page.missing && page.pageid > 0 && page.title, `Missing/non-original namespace source: action=query; requested title=${source.title}; returned title=${page.title ?? '(none)'}`);
+    assert.equal(page.title, source.resolved_title, 'Source title changed after official preflight');
+    assert.equal(page.pageid, source.resolved_page_id, 'Source page changed after official preflight');
     assert.ok(Number.isSafeInteger(revision?.revid) && revision.revid > 0 && /^\d{4}-\d{2}-\d{2}T/u.test(revision.timestamp), 'Source revision must be pinned');
     assert.ok(slot?.contentmodel === 'wikitext' && typeof slot.content === 'string', 'Expected original-source wikitext');
     assert.ok(!/כל הזכויות שמורות|©|\{\{\s*(?:copyright|הזכויות שמורות|שימוש הוגן)|creativecommons\.org\/licenses\/(?!by-sa\/4\.0)/iu.test(slot.content), 'Source declares incompatible or ambiguous license');
@@ -120,14 +155,14 @@ async function collectWiki({ fetchJson = requestJson, sources = WIKI_SOURCES } =
     assert.ok(text.length >= 100 && /[\u05d0-\u05ea]/u.test(text), 'Source extraction is empty or non-Hebrew');
     const origin = `https://he.wikisource.org/w/index.php?title=${encodeURIComponent(page.title)}&oldid=${revision.revid}`;
     rows.push({ schema_version: 1, doc_id: `hewikisource:${page.pageid}:${revision.revid}`, genre: source.genre,
-      title: page.title, requested_title: source.title, split: 'dev', original_text: text, content_sha256: sha256(text),
+      title: page.title, requested_title: source.original_requested_title, exact_title_candidate: source.title, split: 'dev', original_text: text, content_sha256: sha256(text),
       source_license: license.id, source_origin: origin, license_evidence: license,
       attribution: `${source.author}; Hebrew Wikisource contributors; ${origin}; ${license.id}`,
       provenance: { publisher: license.publisher, original_author: source.author, page_id: page.pageid, namespace: 0,
         revision_id: revision.revid, revision_timestamp: revision.timestamp, revision_last_editor: revision.user,
         page_history: `https://he.wikisource.org/w/index.php?title=${encodeURIComponent(page.title)}&action=history`,
         wikitext_sha256: sha256(slot.content), rendered_html_sha256: sha256(html), query_response_sha256: response.sha256,
-        parse_response_sha256: parsed.sha256, siteinfo_sha256: site.sha256, extractor: 'wikiPlainText-v1',
+        parse_response_sha256: parsed.sha256, siteinfo_sha256: site.sha256, title_resolution_sha256: source.title_resolution_sha256, extractor: 'wikiPlainText-v1',
         extractor_sha256: sha256(wikiPlainText.toString() + decodeEntities.toString()),
         source_kind: 'rendered community edition of ancient original; human verification still required',
         transclusion_warning: 'oldid pins the source page, not historical revisions of transcluded templates; rendered derivative hash pins the collected bytes' } });
@@ -135,7 +170,7 @@ async function collectWiki({ fetchJson = requestJson, sources = WIKI_SOURCES } =
   assert.ok(Buffer.byteLength(JSON.stringify(rows)) < 1000000, 'Prepared corpus exceeds one megabyte');
   return { schema_version: 1, classification: 'LICENSED INPUT / HUMAN REVIEW NOT DONE', sources: rows,
     collection: { official_host: 'he.wikisource.org', total_downloaded_bytes: budget.used, siteinfo_sha256: site.sha256,
-      collector_sha256: sha256(JSON.stringify([WIKI_USER_AGENT, sources, ...[wikiUrl, retryPlan, requestAttempt, requestJson, decodeEntities, wikiPlainText, verifyWikiLicense, collectWiki].map(fn => fn.toString())])),
+      collector_sha256: sha256(JSON.stringify([WIKI_USER_AGENT, sources, ...[wikiUrl, retryPlan, requestAttempt, requestJson, decodeEntities, wikiPlainText, verifyWikiLicense, resolveWikiSources, collectWiki].map(fn => fn.toString())])),
       request_policy: { serial: true, minimum_start_interval_ms: 1500, retry_statuses: [429, 503], maximum_attempts: 3,
         maximum_retry_after_ms: 60000, maximum_request_wall_ms: 20000, maximum_collection_wall_ms: 540000, redirects: false },
       licenses: [license], human_review: false } };

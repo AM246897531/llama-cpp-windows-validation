@@ -34,7 +34,7 @@ jobs:
           # is needed. A native-log artifact needs its own producer's safety flag.
           MAX_FILE_BYTES = 64 * 1024 * 1024
           MAX_TOTAL_BYTES = 256 * 1024 * 1024
-          CHUNK_CHARACTERS = 64 * 1024
+          CHUNK_CHARACTERS = 8 * 1024
           artifact_name = re.compile(r'bounded-windows-(?:calibration|benchmark-[a-z0-9-]+)-(metadata|native-logs)\Z')
           metadata_names = {'run-manifest.json', 'memory.jsonl', 'benchmark.jsonl', 'defender.json'}
           native_names = {'native.stdout.log', 'native.stderr.log'}
