@@ -1,0 +1,43 @@
+name: Collect small licensed ancient-text review inputs
+on:
+  push:
+    branches: [bench/windows-dicta-validation]
+    paths: [scripts/bench/wikisource-collector.cjs, .github/workflows/wikisource-collection.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.19.0
+      - name: Collect official licensed source revisions
+        shell: bash
+        run: |
+          mkdir -p work
+          node scripts/bench/wikisource-collector.cjs > work/wiki-corpus.json
+      - name: Log exact compressed public input bytes
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs'), crypto = require('node:crypto'), zlib = require('node:zlib');
+          const raw = fs.readFileSync('work/wiki-corpus.json');
+          if (raw.length > 1000000) throw new Error('Public source corpus size limit exceeded');
+          const corpus = JSON.parse(raw);
+          if (corpus.collection?.human_review !== false || corpus.collection?.official_host !== 'he.wikisource.org') throw new Error('Unexpected corpus origin/classification');
+          const compressed = zlib.gzipSync(raw);
+          console.log('PUBLIC_CORPUS_BEGIN ' + JSON.stringify({path:'wiki-corpus.json', bytes:raw.length, sha256:crypto.createHash('sha256').update(raw).digest('hex'), compressed_sha256:crypto.createHash('sha256').update(compressed).digest('hex'), classification:'LICENSED INPUT / HUMAN REVIEW NOT DONE'}));
+          const encoded = compressed.toString('base64');
+          for (let i = 0; i < encoded.length; i += 24000) console.log('PUBLIC_CORPUS_DATA ' + encoded.slice(i, i + 24000));
+          console.log('PUBLIC_CORPUS_END');
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: licensed-ancient-source-inputs
+          path: work/wiki-corpus.json
+          retention-days: 7
+          if-no-files-found: error
