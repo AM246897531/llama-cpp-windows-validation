@@ -52,8 +52,10 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/bench/windows-model-calibration.ps1 -ProbeOnly -ResultDirectory work/calibration-process-probe
-          if ($LASTEXITCODE -ne 0) { throw 'Tiny owned process and explicit offline environment probe failed' }
+          $probeCode = $LASTEXITCODE
           $report = Get-Content work/calibration-process-probe/run-manifest.json -Raw | ConvertFrom-Json
+          $report | ConvertTo-Json -Depth 12 | Write-Output
+          if ($probeCode -ne 0) { throw 'Tiny owned process and explicit offline environment probe failed; see bounded manifest above' }
           if (-not $report.safety.explicit_offline_child_environment.StartsWith('MEASURED')) { throw 'Explicit child environment was not verified' }
           $report.safety | ConvertTo-Json -Depth 12 | Write-Output
       - name: Measure selected case within the enforced memory envelope
