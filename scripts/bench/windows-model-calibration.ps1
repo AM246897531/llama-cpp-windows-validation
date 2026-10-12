@@ -49,7 +49,9 @@ $runtimeManifestPath = Join-Path $repoRoot 'manifests/llama-runtime.json'
 $model = Get-Content -Raw -LiteralPath $modelManifestPath | ConvertFrom-Json
 $runtime = Get-Content -Raw -LiteralPath $runtimeManifestPath | ConvertFrom-Json
 $requiredAvailableBytes = [long]$model.bytes + $privateCommitLimitBytes + $floorBytes
+$requestedBallastBytes = [long]$BallastGiB * 1GB
 $admissions = [Collections.Generic.List[object]]::new()
+$admissionSettling = [Collections.Generic.List[object]]::new()
 $memorySampleRetentionLimit = 64
 $samples = [Collections.Generic.Queue[object]]::new($memorySampleRetentionLimit)
 $memorySampleCount = [long]0
@@ -85,6 +87,44 @@ function Test-Admission([string]$Stage, [long]$AdditionalBallastBytes = 0) {
         additional_ballast_reserved_bytes = $AdditionalBallastBytes;
         overhead_status = 'INITIAL bounded experiment informed by Linux; NOT measured Windows overhead; NOT production admission' })
     return $ok
+}
+function Wait-ForAdmission([string]$Stage, [long]$AdditionalBallastBytes = 0,
+    [ValidateRange(0, 120)][int]$MaxWaitSeconds = 120,
+    [ValidateRange(1, 5)][int]$CheckIntervalSeconds = 5) {
+    # Download verification and protected scanning can consume temporary RAM.
+    # Wait passively for actual admission; never reclaim memory or change any
+    # security/model/cache setting. Bound elapsed time and the number of checks.
+    $settleWatch = [Diagnostics.Stopwatch]::StartNew()
+    $record = [ordered]@{ stage = $Stage; maximum_wait_seconds = $MaxWaitSeconds;
+        check_interval_seconds = $CheckIntervalSeconds; started_at_utc = [DateTime]::UtcNow.ToString('o');
+        checks = 0; status = 'NOT_ADMITTED'; elapsed_ms = 0;
+        required_available_bytes = $requiredAvailableBytes + $AdditionalBallastBytes;
+        additional_ballast_reserved_bytes = $AdditionalBallastBytes;
+        policy = 'Passive bounded wait; unchanged full model + private cap + floor; no cache purge or security changes' }
+    $admissionSettling.Add($record)
+    $maximumChecks = [int][Math]::Floor($MaxWaitSeconds / $CheckIntervalSeconds) + 1
+    try {
+        for ($attempt = 1; $attempt -le $maximumChecks; $attempt++) {
+            $record.checks = $attempt
+            $admitted = Test-Admission "$Stage / settling check $attempt" $AdditionalBallastBytes
+            $last = $admissions[$admissions.Count - 1]
+            $record.last_available_bytes = $last.available_bytes
+            $record.last_total_bytes = $last.total_bytes
+            if ($admitted) { $record.status = 'ADMITTED'; return $true }
+            if ($last.total_bytes -lt $minimumVisibleBytes) { $record.status = 'MINIMUM_HARDWARE_REJECTED'; return $false }
+            if ($last.total_bytes -lt ($requiredAvailableBytes + $AdditionalBallastBytes)) {
+                $record.status = 'TOTAL_CAPACITY_REJECTED'; return $false
+            }
+            if ($attempt -eq $maximumChecks -or $settleWatch.Elapsed.TotalSeconds -ge $MaxWaitSeconds) { break }
+            $delay = [int][Math]::Min($CheckIntervalSeconds, [Math]::Floor($MaxWaitSeconds - $settleWatch.Elapsed.TotalSeconds))
+            if ($delay -lt 1) { break }
+            Start-Sleep -Seconds $delay
+        }
+        return $false
+    } finally {
+        $record.elapsed_ms = $settleWatch.Elapsed.TotalMilliseconds
+        $record.finished_at_utc = [DateTime]::UtcNow.ToString('o')
+    }
 }
 function Get-VerifiedDownload([string]$Uri, [string]$Destination, [string]$Digest, [long]$Bytes = 0) {
     if (Test-Path -LiteralPath $Destination) {
@@ -506,7 +546,7 @@ $manifest = [ordered]@{ schema_version = 1; status = 'INITIALIZING'; started_at_
         pp500_1500_3000_tg = 'NOT TESTED'; full_context_occupancy = 'NOT TESTED'; three_warmups_thirty_samples = 'NOT TESTED';
         ballast0_2_4 = 'NOT TESTED'; sustained_5min_thermal = 'NOT TESTED'; cold_reboot_purge = 'NOT TESTED';
         power_ac_battery_matrix = 'NOT TESTED'; production_flag_performance_quality = 'NOT TESTED'; full_I3 = 'NOT VALIDATED' };
-    admissions = $admissions }
+    admissions = $admissions; admission_settling = $admissionSettling }
 if ($WarmBenchmark) {
     $manifest.benchmark = [ordered]@{ mode = 'resident server warm benchmark'; selected_probes = $selectedProbes;
         warmup_runs_per_pp_tg_case = $WarmupRuns; measured_runs_per_pp_tg_case = $Repetitions; ballast_gib = $BallastGiB;
@@ -540,7 +580,7 @@ try {
     catch { $manifest.defender = [ordered]@{ status = 'NOT TESTED'; realtime_enabled = $null; settings_changed = $false } }
     $configJson = $manifest.config | ConvertTo-Json -Depth 12 -Compress
     $manifest.config_sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($configJson))).ToLowerInvariant()
-    $initialAdmission = Test-Admission 'initial capability probe before downloads or model load' ([long]$BallastGiB * 1GB)
+    $initialAdmission = Test-Admission 'initial capability probe before downloads or model load' $requestedBallastBytes
     $counters = [KesherCalibration.Counters]::new()
     $ready = Get-CounterReadiness
     $manifest.safety.pdh_available_and_pages_input = 'MEASURED: real English PDH gauges available; no zero-fill fallback'
@@ -578,7 +618,7 @@ try {
     if ($asset.name -ne 'llama-b11559-bin-win-cpu-x64.zip' -or $asset.sha256 -ne '1228f133868c02a424bcf663a688e66d8c7d5499077649f305188f756f584377') { throw 'Pinned Windows CPU asset changed; review required.' }
     $archive = Join-Path $RuntimeDirectory $asset.name
     Get-VerifiedDownload ("https://github.com/ggml-org/llama.cpp/releases/download/$($runtime.release)/$($asset.name)") $archive $asset.sha256
-    if (-not (Test-Admission 'before pinned model download')) { $manifest.status = 'NOT_ADMITTED'; $exitCode = 2; return }
+    if (-not (Test-Admission 'before pinned model download' $requestedBallastBytes)) { $manifest.status = 'NOT_ADMITTED'; $exitCode = 2; return }
     Get-VerifiedDownload ("https://huggingface.co/$($model.repository)/resolve/$($model.revision)/$($model.filename)") $ModelPath $model.sha256 ([long]$model.bytes)
     $extraction = Join-Path $RuntimeDirectory ('calibration-verified-' + [Guid]::NewGuid().ToString('N'))
     Expand-Archive -LiteralPath $archive -DestinationPath $extraction
@@ -600,7 +640,7 @@ try {
         $manifest.benchmark.ballast_bytes_committed_and_touched = [long]$BallastGiB * 1GB
         $pressureSince = $null
     }
-    if (-not (Test-Admission 'immediately before bounded model child')) { $manifest.status = 'NOT_ADMITTED'; $exitCode = 2; return }
+    if (-not (Wait-ForAdmission 'immediately before bounded model child')) { $manifest.status = 'NOT_ADMITTED'; $exitCode = 2; return }
     New-PrivateKeyFile
     $manifest.safety.current_user_only_key_acl = 'MEASURED: protected current-user-only parent ACL and verified key inheritance; 256-bit random ephemeral key'
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)

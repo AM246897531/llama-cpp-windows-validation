@@ -92,6 +92,20 @@ cases report `NOT_ADMITTED`; they are not forced onto 16 GiB hardware by
 shrinking product parameters. Ballast belongs to the harness, outside the
 native child's private-commit cap.
 
+Initial admission and the check before downloading the large model both reserve
+the entire requested ballast in addition to the model, private-commit cap and
+floor. An obviously unsafe ballast case exits before the 7.5 GB download.
+Immediately before launching the model, a passive settling check may wait up to
+120 seconds, querying actual Windows available memory every five seconds after
+download verification and protected scanning. It launches only after a fresh
+observation satisfies the unchanged budget. It never purges cache, changes
+Defender, reduces reservations or starts a model while waiting. Insufficient
+hardware or total capacity rejects immediately; persistent pressure still yields
+`NOT_ADMITTED`. The manifest records each admission snapshot and an
+`admission_settling` summary with attempts, observed elapsed time and outcome.
+Already allocated ballast is reflected in actual available memory at this final
+check; it is not subtracted a second time.
+
 `run-manifest.json` retains script/config/model/native/archive/source hashes,
 actual hardware, Defender, active power plan, admission and cleanup observations,
 case counts and memory peaks. Public CI may retain only the manifest,

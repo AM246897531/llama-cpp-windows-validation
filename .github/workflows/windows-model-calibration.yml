@@ -4,24 +4,31 @@ on:
     branches: [bench/windows-dicta-validation]
     paths: [scripts/bench/windows-model-calibration.ps1, manifests/**, .github/workflows/windows-model-calibration.yml]
   workflow_dispatch:
+    inputs:
+      probe:
+        description: Selected bounded performance probe; all runs the protocol matrix
+        required: true
+        default: pp1500
+        type: choice
+        options: [pp500, pp1500, pp3000, tg128, full-context, thermal, all]
+      ballast:
+        description: Owned ballast GiB; unsafe cases are rejected before model download
+        required: true
+        default: '0'
+        type: choice
+        options: ['0', '2', '4']
 permissions:
   contents: read
 jobs:
   warm-benchmark:
     runs-on: windows-latest
-    timeout-minutes: ${{ matrix.job_minutes }}
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        include:
-          - { probe: pp1500, ballast: 0, job_minutes: 120, owned_seconds: 6600, request_seconds: 900 }
-          - { probe: pp3000, ballast: 0, job_minutes: 120, owned_seconds: 6600, request_seconds: 900 }
-          - { probe: tg128, ballast: 0, job_minutes: 180, owned_seconds: 9600, request_seconds: 1800 }
-          - { probe: thermal, ballast: 0, job_minutes: 30, owned_seconds: 1200, request_seconds: 900 }
-          - { probe: full-context, ballast: 0, job_minutes: 330, owned_seconds: 18000, request_seconds: 1800 }
-          - { probe: pp500, ballast: 2, job_minutes: 30, owned_seconds: 1200, request_seconds: 900 }
-          - { probe: pp500, ballast: 4, job_minutes: 30, owned_seconds: 1200, request_seconds: 900 }
+        probe: ${{ fromJSON(inputs.probe == 'all' && '["pp500","pp1500","pp3000","tg128","full-context","thermal"]' || format('["{0}"]', inputs.probe || 'pp1500')) }}
+        ballast: ${{ fromJSON(format('[{0}]', inputs.ballast || '0')) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Enable Defender real-time protection for this disposable benchmark runner
@@ -47,7 +54,7 @@ jobs:
       - name: Measure selected case within the enforced memory envelope
         shell: pwsh
         run: |
-          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BallastGiB ${{ matrix.ballast }} -TimeoutSeconds ${{ matrix.request_seconds }} -BenchmarkTimeoutSeconds ${{ matrix.owned_seconds }} -ResultDirectory work/calibration
+          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BallastGiB ${{ matrix.ballast }} -TimeoutSeconds 1800 -BenchmarkTimeoutSeconds 18000 -ResultDirectory work/calibration
           $code = $LASTEXITCODE
           if ($code -eq 2 -and '${{ matrix.ballast }}' -ne '0') {
             $manifest = Get-Content work/calibration/run-manifest.json -Raw | ConvertFrom-Json
