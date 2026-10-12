@@ -11,7 +11,7 @@ param(
     [ValidateSet(0, 2, 4)][int]$BallastGiB = 0,
     [ValidateRange(3, 20)][int]$WarmupRuns = 3,
     [ValidateRange(30, 120)][int]$Repetitions = 30,
-    [ValidateRange(360, 6900)][int]$BenchmarkTimeoutSeconds = 6900,
+    [ValidateRange(360, 18000)][int]$BenchmarkTimeoutSeconds = 6900,
     [ValidateRange(1, 128)][int]$Threads = 4,
     [ValidateRange(60, 1800)][int]$TimeoutSeconds = 360,
     [ValidateSet('GITHUB_WINDOWS_RUNNER', 'REPRESENTATIVE_16GB_WINDOWS', 'TARGET_MACHINE')]
@@ -50,7 +50,13 @@ $model = Get-Content -Raw -LiteralPath $modelManifestPath | ConvertFrom-Json
 $runtime = Get-Content -Raw -LiteralPath $runtimeManifestPath | ConvertFrom-Json
 $requiredAvailableBytes = [long]$model.bytes + $privateCommitLimitBytes + $floorBytes
 $admissions = [Collections.Generic.List[object]]::new()
-$samples = [Collections.Generic.List[object]]::new()
+$memorySampleRetentionLimit = 64
+$samples = [Collections.Generic.Queue[object]]::new($memorySampleRetentionLimit)
+$memorySampleCount = [long]0
+$lastMemorySample = $null
+$memoryPeakMetrics = @('working_set_bytes', 'native_peak_working_set_bytes', 'private_working_set_bytes', 'private_committed_bytes', 'job_peak_private_committed_bytes')
+$memoryPeaks = [ordered]@{}
+foreach ($metric in $memoryPeakMetrics) { $memoryPeaks[$metric] = $null }
 $ownedChild = $null; $counters = $null; $memoryWriter = $null; $http = $null
 $keyDirectory = $null; $keyPath = $null; $token = $null; $exitCode = 1
 $probeCleanupSafe = $true
@@ -254,6 +260,22 @@ function Assert-SampleSafety([long]$Available, [object]$PagesInput, [double]$Ela
         if ($ElapsedSeconds - $script:pressureSince -gt 5) { throw 'THRASHING_CANCEL: sustained Pages Input >500/sec near memory floor; INITIAL diagnostic threshold.' }
     } else { $script:pressureSince = $null }
 }
+function Add-MemorySample([object]$Snapshot) {
+    # Raw observations stay complete on disk. Only recent objects remain in
+    # heap; indices and all-run peaks must never depend on the bounded queue.
+    $Snapshot['sample_index'] = $script:memorySampleCount
+    $memoryWriter.WriteLine(($Snapshot | ConvertTo-Json -Depth 10 -Compress)); $memoryWriter.Flush()
+    foreach ($metric in $memoryPeakMetrics) {
+        $value = $Snapshot[$metric]
+        if ($null -ne $value -and ($null -eq $memoryPeaks[$metric] -or [ulong]$value -gt [ulong]$memoryPeaks[$metric])) {
+            $memoryPeaks[$metric] = [ulong]$value
+        }
+    }
+    if ($samples.Count -ge $memorySampleRetentionLimit) { [void]$samples.Dequeue() }
+    $samples.Enqueue($Snapshot)
+    $script:lastMemorySample = $Snapshot
+    $script:memorySampleCount++
+}
 function Invoke-Watchdog {
     if ($ownedChild.HasExited) { throw "Owned child exited unexpectedly (exit $($ownedChild.ExitCode)); inspect sanitized native logs." }
     $native = $ownedChild.Memory()
@@ -263,8 +285,7 @@ function Invoke-Watchdog {
     $snapshot = [ordered]@{ elapsed_ms = $watch.Elapsed.TotalMilliseconds; phase = $phase; owned_pid = $ownedChild.Pid;
         available_bytes = $available; pdh = $pdh; memory_source = 'Windows PROCESS_MEMORY_COUNTERS_EX2 and bounded Job counters' }
     foreach ($key in $native.Keys) { $snapshot[$key] = $native[$key] }
-    $samples.Add($snapshot)
-    $memoryWriter.WriteLine(($snapshot | ConvertTo-Json -Depth 10 -Compress)); $memoryWriter.Flush()
+    Add-MemorySample $snapshot
     Assert-SampleSafety $available $pdh['pages_input_per_sec'] $watch.Elapsed.TotalSeconds
     if ($watch.Elapsed.TotalSeconds -gt $effectiveTimeoutSeconds) { throw 'Calibration/benchmark exceeded bounded case timeout.' }
 }
@@ -324,7 +345,7 @@ function Invoke-NativeBenchmarkCase([string]$Name, [int[]]$Prompt, [int]$Predict
     $request = @{ prompt = $Prompt; n_predict = $Predict; cache_prompt = $false; stream = $false;
         ignore_eos = $true; temperature = 0; seed = 42; return_tokens = $true }
     $caseWatch = [Diagnostics.Stopwatch]::StartNew()
-    $firstSample = $samples.Count
+    $firstSample = $memorySampleCount
     $response = Invoke-LocalRequest '/completion' $true $request $TimeoutSeconds
     try {
         if (-not $response.IsSuccessStatusCode) { throw "Native benchmark HTTP status $([int]$response.StatusCode)." }
@@ -339,7 +360,7 @@ function Invoke-NativeBenchmarkCase([string]$Name, [int[]]$Prompt, [int]$Predict
         prompt_tokens = $Prompt.Count; requested_generation_tokens = $Predict; prompt_token_ids_sha256 = Get-JsonDigest $Prompt;
         native_timings = $timings; truncated = [bool]$body.truncated; stop_type = $body.stop_type;
         request_elapsed_ms = $caseWatch.Elapsed.TotalMilliseconds; first_memory_sample = $firstSample;
-        after_memory_sample = $samples.Count; cold_warm = 'warm-only; resident server, uncontrolled filesystem cache';
+        after_memory_sample = $memorySampleCount; cold_warm = 'warm-only; resident server, uncontrolled filesystem cache';
         cache_prompt = $false; generation_throughput_interpretable = $Predict -gt 1; quality_claim = $false }
     Write-BenchmarkRecord $record
     if (-not $valid) { throw "Native $Name counts/cache/timings were inconsistent with the selected case; raw timing record retained." }
@@ -621,7 +642,7 @@ try {
     if (-not $healthReady -or [KesherCalibration.OwnedProcess]::ListenerPid($port) -ne $ownedChild.Pid) { throw 'Bounded child did not become the owned healthy loopback server.' }
     $manifest.load_to_health_ms = $watch.Elapsed.TotalMilliseconds
     $manifest.load_time_scope = 'Owned process launch through healthy API; filesystem cache uncontrolled, sampled single run'
-    $manifest.memory_at_health = $samples[$samples.Count - 1]
+    $manifest.memory_at_health = $lastMemorySample
     $phase = 'authentication-probe'
     $response = Invoke-LocalRequest '/v1/models' $false
     try { $manifest.authentication_required = [int]$response.StatusCode -in @(401, 403) } finally { $response.Dispose() }
@@ -639,7 +660,7 @@ try {
         $manifest.schema_valid = $true; $manifest.fixture_usage = $body.usage; $manifest.schema_fixture_ms = $fixtureWatch.Elapsed.TotalMilliseconds
     } finally { $response.Dispose() }
     $phase = 'complete'; Invoke-Watchdog
-    $manifest.memory_after_fixture = $samples[$samples.Count - 1]
+    $manifest.memory_after_fixture = $lastMemorySample
     $manifest.coverage.authenticated_local_schema = 'MEASURED single synthetic structural fixture; not answer quality'
     $manifest.coverage.sampled_load_memory = 'MEASURED single no-repack server process; partial sampling; not full-context stress or throughput'
     if ($WarmBenchmark) {
@@ -691,10 +712,12 @@ try {
     } catch { $manifest.safety.cleanup = 'FAILED key cleanup; outputs must not be uploaded'; $manifest.status = 'FAILED'; $exitCode = 1; $cleanupSafe = $false }
     $manifest.artifact_logs_safe = $cleanupSafe
     $manifest.ephemeral_key_redacted_from_logs = $redacted
-    $manifest.memory_sample_count = $samples.Count
-    foreach ($metric in @('working_set_bytes', 'native_peak_working_set_bytes', 'private_working_set_bytes', 'private_committed_bytes', 'job_peak_private_committed_bytes')) {
-        $manifest['peak_' + $metric] = if ($samples.Count) { [ulong](($samples | ForEach-Object { $_[$metric] } | Measure-Object -Maximum).Maximum) } else { $null }
-    }
+    $manifest.memory_sample_count = $memorySampleCount
+    $manifest.memory_sample_retained_count = $samples.Count
+    $manifest.memory_sample_retention_limit = $memorySampleRetentionLimit
+    $manifest.memory_sample_indices = 'Zero-based global sample_index in streamed memory.jsonl; benchmark first inclusive / after exclusive'
+    $manifest.memory_peak_scope = 'Incremental maxima across every successfully streamed sample, including evicted heap snapshots'
+    foreach ($metric in $memoryPeakMetrics) { $manifest['peak_' + $metric] = $memoryPeaks[$metric] }
     $manifest.finished_at_utc = [DateTime]::UtcNow.ToString('o')
     Write-Json $manifest (Join-Path $ResultDirectory 'run-manifest.json')
     Write-Host "Windows calibration $($manifest.status); manifest: $ResultDirectory/run-manifest.json"

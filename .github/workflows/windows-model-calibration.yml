@@ -9,12 +9,19 @@ permissions:
 jobs:
   warm-benchmark:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.job_minutes }}
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
-        probe: [pp500, full-context]
+        include:
+          - { probe: pp1500, ballast: 0, job_minutes: 120, owned_seconds: 6600, request_seconds: 900 }
+          - { probe: pp3000, ballast: 0, job_minutes: 120, owned_seconds: 6600, request_seconds: 900 }
+          - { probe: tg128, ballast: 0, job_minutes: 180, owned_seconds: 9600, request_seconds: 1800 }
+          - { probe: thermal, ballast: 0, job_minutes: 30, owned_seconds: 1200, request_seconds: 900 }
+          - { probe: full-context, ballast: 0, job_minutes: 330, owned_seconds: 18000, request_seconds: 1800 }
+          - { probe: pp500, ballast: 2, job_minutes: 30, owned_seconds: 1200, request_seconds: 900 }
+          - { probe: pp500, ballast: 4, job_minutes: 30, owned_seconds: 1200, request_seconds: 900 }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Enable Defender real-time protection for this disposable benchmark runner
@@ -40,8 +47,15 @@ jobs:
       - name: Measure selected case within the enforced memory envelope
         shell: pwsh
         run: |
-          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BenchmarkTimeoutSeconds 6600 -ResultDirectory work/calibration
-          if ($LASTEXITCODE -ne 0) { throw "Selected benchmark did not complete: $LASTEXITCODE" }
+          ./scripts/bench/windows-model-calibration.ps1 -WarmBenchmark -ProbeSet '${{ matrix.probe }}' -WarmupRuns 3 -Repetitions 30 -BallastGiB ${{ matrix.ballast }} -TimeoutSeconds ${{ matrix.request_seconds }} -BenchmarkTimeoutSeconds ${{ matrix.owned_seconds }} -ResultDirectory work/calibration
+          $code = $LASTEXITCODE
+          if ($code -eq 2 -and '${{ matrix.ballast }}' -ne '0') {
+            $manifest = Get-Content work/calibration/run-manifest.json -Raw | ConvertFrom-Json
+            if ($manifest.status -ne 'NOT_ADMITTED' -or $null -ne $manifest.owned_pid) { throw 'Unexpected ballast rejection state' }
+            Write-Output 'Requested ballast safely NOT_ADMITTED; no performance claim for this case'
+            exit 0
+          }
+          if ($code -ne 0) { throw "Selected benchmark did not complete: $code" }
       - name: Log capability manifest
         if: always()
         shell: pwsh
@@ -55,7 +69,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: bounded-windows-benchmark-${{ matrix.probe }}-metadata
+          name: bounded-windows-benchmark-${{ matrix.probe }}-ballast${{ matrix.ballast }}-metadata
           path: |
             work/calibration/run-manifest.json
             work/calibration/memory.jsonl
@@ -76,7 +90,7 @@ jobs:
         if: always() && steps.safe-logs.outputs.safe == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: bounded-windows-benchmark-${{ matrix.probe }}-native-logs
+          name: bounded-windows-benchmark-${{ matrix.probe }}-ballast${{ matrix.ballast }}-native-logs
           path: |
             work/calibration/native.stdout.log
             work/calibration/native.stderr.log

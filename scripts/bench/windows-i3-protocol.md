@@ -15,10 +15,16 @@ evidence. Run only on real x64 Windows with PowerShell 7.3+.
 ```
 
 Use separate jobs/result directories for `pp500`, `pp1500`, `pp3000`, `tg128`,
-`full-context` and `thermal`, and for requested ballast 0/2/4 GiB. A job timeout
-of 120 minutes leaves a small margin beyond the maximum 115-minute owned-model
-duration for downloads and reporting; shorten the owned timeout when download
-time needs a larger margin. A case that exceeds its timeout fails with raw
+`full-context` and `thermal`, and for requested ballast 0/2/4 GiB. The default
+owned-model timeout is 6900 seconds (115 minutes); a 120-minute job allows only
+a small margin for downloads and reporting. For the expensive full-context case,
+use `-BenchmarkTimeoutSeconds 18000 -TimeoutSeconds 1800` and a 330-minute job.
+For other probes, a 120-minute job with `-TimeoutSeconds 900` is the current
+candidate; shorten the owned timeout if download time needs a larger margin.
+`BenchmarkTimeoutSeconds` is bounded at five hours, below GitHub's six-hour
+job limit. `TimeoutSeconds` controls each HTTP request and is bounded at thirty
+minutes independently of the total owned-model timeout. These time budgets
+change neither the model/context nor the required samples. A case that exceeds its timeout fails with raw
 completed records retained. The harness never reduces sample counts, model,
 context or memory floor to make the matrix fit. `-ProbeOnly` and
 `-WarmBenchmark` are mutually exclusive.
@@ -41,10 +47,20 @@ sampling. Native `prompt_n`, `predicted_n`, `cache_n`, truncation and positive
 prompt timings are validated before accepting a repetition. Positive generation
 timings are also required for the 128-token probes; a one-token pp request does
 not produce a generation-throughput claim. Native timing records,
-wall-clock request times and memory-sample ranges are appended to
+wall-clock request times and global memory-sample ranges are appended to
 `benchmark.jsonl`; generated prose is not retained or treated as quality
 evidence. The summary contains means, medians, p95, extrema and sample standard
 deviations. Prompt token-ID digests identify the exact synthetic inputs.
+
+The 250ms memory sampling rate is unchanged for long runs. Every observation is
+streamed to `memory.jsonl` with a zero-based global `sample_index`; only the last
+64 snapshot objects are retained in heap. Separate counters and incremental
+all-run peak aggregates preserve observations after queue eviction. The manifest's
+`memory_sample_count` counts all successfully streamed samples; `peak_*` covers
+the entire run, including evicted snapshots. `memory_sample_retained_count` and
+`memory_sample_retention_limit` describe the bounded queue. A benchmark record's
+`first_memory_sample` is inclusive and `after_memory_sample` is exclusive against
+the raw global indices, so evidence remains joinable across hours of sampling.
 
 The thermal case has three short warmups and **one** continuous five-minute
 decode window, beginning at the first token arrival. It records raw token-ID
@@ -87,7 +103,13 @@ reports from all required selections are joined by their exact configuration
 and source identities.
 
 All runs remain **warm-only**: no reboot or verified standby purge is performed.
-Defender and power plans are observed without changing them. Defender off or
+The harness observes Defender and power plans without changing them. The reviewed
+public workflow separately enables real-time protection on its disposable runner
+through supported `Set-MpPreference -DisableRealtimeMonitoring $false`, then
+verifies the actual `Get-MpComputerStatus` state; it never disables protection.
+The workflow's before/after record and the harness's independent observation
+must be retained separately. A requested setting is not proof of active protection.
+Defender off or
 unknown invalidates the required real-time-protected baseline conditions even
 when performance samples complete. Memory channels, CPU efficiency topology,
 GPU details, Balanced/Best-performance and AC/battery matrices, isolated cold

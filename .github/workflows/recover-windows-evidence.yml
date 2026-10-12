@@ -4,48 +4,179 @@ on:
     branches: [bench/windows-dicta-validation]
     paths: [.github/workflows/recover-windows-evidence.yml]
   workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Completed Windows calibration run to recover; measurements are never rerun
+        required: false
+        default: '38227197119'
+        type: string
 permissions:
   contents: read
   actions: read
 jobs:
   recover:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Retrieve original artifacts without re-running the model
+      - name: Recover only bounded original Windows evidence
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run download 38224224739 --repo '${{ github.repository }}' --dir recovered
-      - name: Log bounded original memory samples and buffer metadata
+          RECOVERY_REPOSITORY: ${{ github.repository }}
+          RECOVERY_SOURCE_RUN_ID: ${{ inputs.source_run_id || '38227197119' }}
         run: |
           python3 - <<'PY'
-          import json, hashlib
+          import base64, gzip, hashlib, json, os, re, subprocess
           from pathlib import Path
-          directory = Path('recovered/bounded-windows-calibration-metadata')
-          manifest = json.loads((directory/'run-manifest.json').read_text())
-          assert manifest['source_commit'] == 'ee69541eeae0b9bf633600477f9c84c448408c22'
-          assert manifest['status'] == 'MEASURED_PARTIAL' and manifest['artifact_logs_safe']
-          memory = directory/'memory.jsonl'
-          data = memory.read_bytes()
-          assert len(data) <= 2*1024*1024
-          rows = [json.loads(line) for line in data.decode().splitlines() if line.strip()]
-          assert len(rows) == manifest['memory_sample_count']
-          print('ORIGINAL_WINDOWS_JSON_BEGIN memory.jsonl')
-          print(data.decode(), end='')
-          print('ORIGINAL_WINDOWS_JSON_END memory.jsonl')
-          records = {'original_run': 38224224739, 'original_source_commit': manifest['source_commit'],
-              'memory_bytes': len(data), 'memory_rows': len(rows), 'memory_sha256': hashlib.sha256(data).hexdigest(),
-              'recovery_classification': 'Artifact recovery on Linux; all measurements originate in the original Windows run',
-              'native_buffer_lines': []}
-          logs = Path('recovered/bounded-windows-calibration-native-logs')
-          for name in ['native.stdout.log','native.stderr.log']:
-              raw = (logs/name).read_bytes()
-              records[name+'_sha256'] = hashlib.sha256(raw).hexdigest()
-              for line in raw.decode(errors='replace').splitlines():
-                  if any(term in line for term in ['CPU_Mapped','model buffer size','KV buffer size','RS buffer size','compute buffer size']):
-                      records['native_buffer_lines'].append(line)
-          print('ORIGINAL_WINDOWS_JSON_BEGIN integrity.json')
-          print(json.dumps(records, indent=2))
-          print('ORIGINAL_WINDOWS_JSON_END integrity.json')
+
+          # This job only retrieves files from this repository's completed run.
+          # Linux recovery is never a new Windows measurement. No checkout,
+          # private source, model download, ephemeral key file or unknown file
+          # is needed. A native-log artifact needs its own producer's safety flag.
+          MAX_FILE_BYTES = 64 * 1024 * 1024
+          MAX_TOTAL_BYTES = 256 * 1024 * 1024
+          CHUNK_CHARACTERS = 64 * 1024
+          artifact_name = re.compile(r'bounded-windows-(?:calibration|benchmark-[a-z0-9-]+)-(metadata|native-logs)\Z')
+          metadata_names = {'run-manifest.json', 'memory.jsonl', 'benchmark.jsonl', 'defender.json'}
+          native_names = {'native.stdout.log', 'native.stderr.log'}
+          credential_patterns = [
+              re.compile(rb'\bgh[pousr]_[A-Za-z0-9]{20,}\b'),
+              re.compile(rb'\bgithub_pat_[A-Za-z0-9_]{20,}\b'),
+              re.compile(rb'(?i)authorization\s*[:=]\s*["\']?bearer\s+[A-Za-z0-9_.-]{16,}'),
+              re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
+              re.compile(rb'(?i)["\'](?:api[_-]?key|access[_-]?token|password|client[_-]?secret)["\']\s*:\s*["\'](?!<redacted|<ephemeral)[^"\']{8,}'),
+          ]
+
+          def canonical(value):
+              return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+
+          def gh(*arguments):
+              result = subprocess.run(['gh', *arguments], capture_output=True, check=False)
+              if result.returncode:
+                  # Redirect URLs or credentials in CLI diagnostics never enter logs.
+                  raise RuntimeError('Authenticated artifact recovery command failed; no CLI diagnostics logged')
+              return result.stdout
+
+          repository = os.environ['RECOVERY_REPOSITORY']
+          run_text = os.environ['RECOVERY_SOURCE_RUN_ID']
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+              raise ValueError('Invalid recovery repository')
+          if not re.fullmatch(r'[1-9][0-9]{0,19}', run_text):
+              raise ValueError('source_run_id must contain only decimal digits')
+          run_id = int(run_text)
+          run = json.loads(gh('api', f'repos/{repository}/actions/runs/{run_id}'))
+          source_commit = run.get('head_sha', '')
+          if run.get('id') != run_id or run.get('status') != 'completed' or not re.fullmatch(r'[a-f0-9]{40}', source_commit):
+              raise ValueError('Source run must be completed and have a full commit SHA')
+          if run.get('repository', {}).get('full_name', '').casefold() != repository.casefold():
+              raise ValueError('Source run belongs to a different repository')
+          pages = json.loads(gh('api', f'repos/{repository}/actions/runs/{run_id}/artifacts', '--paginate', '--slurp'))
+          artifacts = [entry for page in pages for entry in page.get('artifacts', [])
+                       if artifact_name.fullmatch(entry.get('name', '')) and not entry.get('expired')]
+          names = [entry['name'] for entry in artifacts]
+          if len(names) != len(set(names)):
+              raise ValueError('Artifact names are ambiguous')
+          if not any(name.endswith('-metadata') for name in names):
+              raise ValueError('No unexpired bounded Windows metadata artifacts found')
+          if any(not isinstance(entry.get('size_in_bytes'), int) or entry['size_in_bytes'] < 0
+                 or entry['size_in_bytes'] > MAX_TOTAL_BYTES for entry in artifacts):
+              raise ValueError('Artifact download size exceeds the recovery bound')
+          if sum(entry['size_in_bytes'] for entry in artifacts) > MAX_TOTAL_BYTES:
+              raise ValueError('Combined artifact download size exceeds the recovery bound')
+
+          root = Path('recovered')
+          root.mkdir()
+          manifests = {}
+          selected = []
+          total_bytes = 0
+
+          def read_bounded(path):
+              if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+                  raise ValueError('Evidence file is not a bounded regular file')
+              data = path.read_bytes()
+              if len(data) > MAX_FILE_BYTES:
+                  raise ValueError('Evidence file grew beyond its bound')
+              if any(pattern.search(data) for pattern in credential_patterns):
+                  raise ValueError('Evidence contains a possible credential; recovery withheld')
+              return data
+
+          def download(name):
+              directory = root / name
+              gh('run', 'download', run_text, '--repo', repository, '--name', name, '--dir', str(directory))
+              return directory
+
+          def collect(name, directory, allowed):
+              global total_bytes
+              found_names = set()
+              for path in sorted(directory.rglob('*')):
+                  if path.name not in allowed:
+                      continue
+                  relative = path.relative_to(directory)
+                  # Metadata upload paths are either flat or calibration/*.
+                  # Native upload paths are flat. Unrecognized paths stay unread.
+                  if len(relative.parts) > 2 or (len(relative.parts) == 2 and relative.parts[0] != 'calibration'):
+                      continue
+                  if path.name in found_names:
+                      raise ValueError('Duplicate evidence basenames are ambiguous')
+                  found_names.add(path.name)
+                  data = read_bounded(path)
+                  if path.name.endswith('.json'):
+                      if not isinstance(json.loads(data), dict):
+                          raise ValueError('Evidence JSON must be an object')
+                  elif path.name.endswith('.jsonl'):
+                      rows = [json.loads(line) for line in data.splitlines() if line.strip()]
+                      if any(not isinstance(row, dict) for row in rows):
+                          raise ValueError('Evidence JSONL records must be objects')
+                      if path.name == 'memory.jsonl' and len(rows) != manifests[name]['memory_sample_count']:
+                          raise ValueError('Memory sample count does not match its producer manifest')
+                  total_bytes += len(data)
+                  if total_bytes > MAX_TOTAL_BYTES:
+                      raise ValueError('Combined uncompressed evidence exceeds the recovery bound')
+                  selected.append((name, relative.as_posix(), data))
+
+          for name in sorted(name for name in names if name.endswith('-metadata')):
+              directory = download(name)
+              candidates = [path for path in directory.rglob('run-manifest.json')
+                            if len(path.relative_to(directory).parts) <= 2]
+              if len(candidates) != 1:
+                  raise ValueError('Each metadata artifact needs exactly one producer manifest')
+              manifest = json.loads(read_bounded(candidates[0]))
+              if manifest.get('schema_version') != 1 or manifest.get('source_commit') != source_commit:
+                  raise ValueError('Producer manifest schema or source commit does not match the source run')
+              if not isinstance(manifest.get('memory_sample_count'), int) or manifest['memory_sample_count'] < 0:
+                  raise ValueError('Producer manifest lacks a valid sample count')
+              manifests[name] = manifest
+              collect(name, directory, metadata_names)
+
+          for name in sorted(name for name in names if name.endswith('-native-logs')):
+              metadata_name = name[:-len('-native-logs')] + '-metadata'
+              if metadata_name not in manifests or manifests[metadata_name].get('artifact_logs_safe') is not True:
+                  continue
+              collect(name, download(name), native_names)
+
+          # Validate every file before printing the first data byte. Gzip mtime=0
+          # plus exact raw/gzip digests makes CRLF, chunk loss and masked-log data
+          # detectable by a decoder; each base64 line stays below 80 KiB.
+          index = []
+          payloads = []
+          for name, relative, data in selected:
+              compressed = gzip.compress(data, compresslevel=6, mtime=0)
+              encoded = base64.b64encode(compressed).decode('ascii')
+              record = {'artifact': name, 'path': relative, 'bytes': len(data),
+                        'sha256': hashlib.sha256(data).hexdigest(), 'encoding': 'gzip+base64',
+                        'gzip_bytes': len(compressed), 'gzip_sha256': hashlib.sha256(compressed).hexdigest(),
+                        'base64_characters': len(encoded),
+                        'chunks': (len(encoded) + CHUNK_CHARACTERS - 1) // CHUNK_CHARACTERS}
+              index.append(record)
+              payloads.append((record, encoded))
+          index_sha256 = hashlib.sha256(canonical(index).encode('ascii')).hexdigest()
+          summary = {'schema_version': 1, 'source_run_id': run_id, 'source_commit': source_commit,
+                     'classification': 'Linux artifact recovery; all measurements originate in the completed Windows run',
+                     'file_count': len(index), 'total_bytes': total_bytes, 'index_sha256': index_sha256, 'files': index}
+          print('WINDOWS_EVIDENCE_INDEX ' + canonical(summary))
+          for record, encoded in payloads:
+              print('WINDOWS_EVIDENCE_BEGIN ' + canonical(record))
+              for ordinal, start in enumerate(range(0, len(encoded), CHUNK_CHARACTERS), 1):
+                  print(f'WINDOWS_EVIDENCE_CHUNK {ordinal}/{record["chunks"]} ' + encoded[start:start + CHUNK_CHARACTERS])
+              print('WINDOWS_EVIDENCE_END ' + canonical({'artifact': record['artifact'], 'path': record['path'], 'sha256': record['sha256']}))
+          print('WINDOWS_EVIDENCE_COMPLETE ' + canonical({'source_run_id': run_id, 'index_sha256': index_sha256, 'file_count': len(index)}))
           PY
