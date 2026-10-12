@@ -1,0 +1,9 @@
+{
+  "repository": "dicta-il/DictaLM-3.0-Nemotron-12B-Instruct-GGUF",
+  "revision": "aa611a04a6eecb3dcd2653e63ebe58d3050f5b03",
+  "filename": "DictaLM-3.0-Nemotron-12B-Instruct-Q4_K_M.gguf",
+  "bytes": 7494495200,
+  "sha256": "ca0af13ef66768ca835fbbdb122959a06fc9d42b23a7b2b2bc38bf75b09ab0e6",
+  "license_name": "NVIDIA Open Model License",
+  "license_url": "https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/"
+}

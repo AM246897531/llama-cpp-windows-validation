@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp",
+  "release": "b11559",
+  "commit": "f2cc7282ce0042641df55e0e563b75e824e2b647",
+  "license": "MIT",
+  "assets": {
+    "windows-x64": {
+      "name": "llama-b11559-bin-win-cpu-x64.zip",
+      "sha256": "1228f133868c02a424bcf663a688e66d8c7d5499077649f305188f756f584377"
+    }
+  }
+}

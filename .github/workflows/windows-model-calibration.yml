@@ -1,0 +1,57 @@
+name: Bounded native Windows model calibration
+on:
+  push:
+    branches: [bench/windows-dicta-validation]
+    paths: [scripts/bench/windows-model-calibration.ps1, manifests/**, .github/workflows/windows-model-calibration.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  calibration:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Calibrate within the enforced memory envelope
+        shell: pwsh
+        run: |
+          ./scripts/bench/windows-model-calibration.ps1 -ResultDirectory work/calibration
+          if ($LASTEXITCODE -ne 0) { throw "Bounded calibration did not complete: $LASTEXITCODE" }
+      - name: Log capability manifest
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path work/calibration/run-manifest.json) {
+            Write-Output 'CAPABILITY_JSON_BEGIN run-manifest.json'
+            Get-Content work/calibration/run-manifest.json -Raw | Write-Output
+            Write-Output 'CAPABILITY_JSON_END run-manifest.json'
+          }
+      - name: Retain metadata and memory samples
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bounded-windows-calibration-metadata
+          path: |
+            work/calibration/run-manifest.json
+            work/calibration/memory.jsonl
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Check logs are safe to retain
+        id: safe-logs
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path work/calibration/run-manifest.json) {
+            $manifest = Get-Content work/calibration/run-manifest.json -Raw | ConvertFrom-Json
+            if ($manifest.artifact_logs_safe -eq $true) { 'safe=true' >> $env:GITHUB_OUTPUT }
+          }
+      - name: Retain explicitly checked native logs
+        if: always() && steps.safe-logs.outputs.safe == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bounded-windows-calibration-native-logs
+          path: |
+            work/calibration/native.stdout.log
+            work/calibration/native.stderr.log
+          retention-days: 7
+          if-no-files-found: warn
