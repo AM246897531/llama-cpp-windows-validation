@@ -6,7 +6,7 @@ param(
     [string]$ModelPath,
     [switch]$ProbeOnly,
     [switch]$WarmBenchmark,
-    [ValidateNotNullOrEmpty()][ValidateSet('pp500', 'pp1500', 'pp3000', 'tg128', 'full-context', 'thermal')]
+    [ValidateNotNullOrEmpty()][ValidateSet('pp500', 'pp1500', 'pp3000', 'tg128', 'tg128-1500', 'tg128-3000', 'full-context', 'thermal')]
     [string[]]$ProbeSet = @('pp500', 'pp1500', 'pp3000', 'tg128', 'full-context', 'thermal'),
     [ValidateSet(0, 2, 4)][int]$BallastGiB = 0,
     [ValidateRange(3, 20)][int]$WarmupRuns = 3,
@@ -506,8 +506,8 @@ function Invoke-WarmBenchmark {
             for ($iteration = 1; $iteration -le $WarmupRuns; $iteration++) { [void](Invoke-NativeBenchmarkCase 'thermal-preparation' $tokens[0..63] 32 'warmup' $iteration) }
             $summary.Add((Invoke-ThermalBenchmark $tokens[0..63])); continue
         }
-        $length = switch ($name) { 'pp500' {500}; 'pp1500' {1500}; 'pp3000' {3000}; 'tg128' {500}; 'full-context' {3968} }
-        $predict = if ($name -in @('tg128', 'full-context')) { 128 } else { 1 }
+        $length = switch ($name) { 'pp500' {500}; 'pp1500' {1500}; 'pp3000' {3000}; 'tg128' {500}; 'tg128-1500' {1500}; 'tg128-3000' {3000}; 'full-context' {3968} }
+        $predict = if ($name -in @('tg128', 'tg128-1500', 'tg128-3000', 'full-context')) { 128 } else { 1 }
         $prompt = [int[]]$tokens[0..($length - 1)]
         for ($iteration = 1; $iteration -le $WarmupRuns; $iteration++) { [void](Invoke-NativeBenchmarkCase $name $prompt $predict 'warmup' $iteration) }
         $measured = [Collections.Generic.List[object]]::new()
@@ -549,6 +549,7 @@ $manifest = [ordered]@{ schema_version = 1; status = 'INITIALIZING'; started_at_
     admissions = $admissions; admission_settling = $admissionSettling }
 if ($WarmBenchmark) {
     $manifest.benchmark = [ordered]@{ mode = 'resident server warm benchmark'; selected_probes = $selectedProbes;
+        required_prompt_decode_cases = @('pp500', 'pp1500', 'pp3000', 'tg128', 'tg128-1500', 'tg128-3000');
         warmup_runs_per_pp_tg_case = $WarmupRuns; measured_runs_per_pp_tg_case = $Repetitions; ballast_gib = $BallastGiB;
         maximum_owned_process_elapsed_seconds = $BenchmarkTimeoutSeconds; context_shift = $false; cache_prompt = $false;
         thermal_windows = if ('thermal' -in $selectedProbes) {1} else {0};
@@ -708,9 +709,9 @@ try {
         $manifest.benchmark.defender_realtime_requirement_met = $manifest.defender.status -eq 'MEASURED' -and $manifest.defender.realtime_enabled -eq $true
         $manifest.benchmark.performance_conditions_scope = 'Defender real-time observed only; cold/power/AC-battery/consumer-target conditions remain unvalidated'
         $manifest.coverage.three_warmups_thirty_samples = 'MEASURED on each selected pp/tg/full-context case; see case counts; thermal is one continuous window'
-        if (@('pp500', 'pp1500', 'pp3000', 'tg128') | Where-Object { $_ -notin $selectedProbes }) {
-            $manifest.coverage.pp500_1500_3000_tg = 'PARTIAL selected cases; combine separately hashed successful jobs before claiming the complete matrix'
-        } else { $manifest.coverage.pp500_1500_3000_tg = 'MEASURED selected complete prompt/decode matrix; native counts/cache validated' }
+        if (@('pp500', 'pp1500', 'pp3000', 'tg128', 'tg128-1500', 'tg128-3000') | Where-Object { $_ -notin $selectedProbes }) {
+            $manifest.coverage.pp500_1500_3000_tg = 'PARTIAL selected cases; pp and tg after all 500/1500/3000 prompt sizes require separately hashed successful jobs before claiming the complete matrix'
+        } else { $manifest.coverage.pp500_1500_3000_tg = 'MEASURED pp and tg128 after each 500/1500/3000 prompt size; native counts/cache validated' }
         if ('full-context' -in $selectedProbes) { $manifest.coverage.full_context_occupancy = 'MEASURED 3968 prompt +128 requested/generated tokens at context4096; native counts/truncation validated' }
         if ('thermal' -in $selectedProbes) { $manifest.coverage.sustained_5min_thermal = 'MEASURED one continuous 300-second token-ID arrival window; first/last minute comparison, not proof of thermal causation' }
         $manifest.coverage.ballast0_2_4 = "MEASURED selected ballast $BallastGiB GiB only; other admitted matrix cases require separate successful jobs"

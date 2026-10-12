@@ -15,7 +15,8 @@ evidence. Run only on real x64 Windows with PowerShell 7.3+.
 ```
 
 Use separate jobs/result directories for `pp500`, `pp1500`, `pp3000`, `tg128`,
-`full-context` and `thermal`, and for requested ballast 0/2/4 GiB. The default
+`tg128-1500`, `tg128-3000`, `full-context` and `thermal`, and for requested
+ballast 0/2/4 GiB. The default
 owned-model timeout is 6900 seconds (115 minutes); a 120-minute job allows only
 a small margin for downloads and reporting. For the expensive full-context case,
 use `-BenchmarkTimeoutSeconds 18000 -TimeoutSeconds 1800` and a 330-minute job.
@@ -40,7 +41,16 @@ automatic BOS insertion at the completion endpoint. Input lengths are exact:
 | pp1500 | 1500 | 1 | Native prompt-processing rate |
 | pp3000 | 3000 | 1 | Native prompt-processing rate |
 | tg128 | 500 | 128 | Native generation rate after a 500-token prompt |
+| tg128-1500 | 1500 | 128 | Native generation rate after a 1500-token prompt |
+| tg128-3000 | 3000 | 128 | Native generation rate after a 3000-token prompt |
 | full-context | 3968 | 128 | Request reaches the 4096-token context budget |
+
+`tg128` preserves its existing 500-token input. The two longer decode probes are
+explicit selections and are not added silently to the existing default
+`ProbeSet`. The complete prompt/decode matrix requires successful pp and tg jobs
+at **all three** prompt sizes; default selections remain partial until the
+1500/3000-token decode reports are joined with matching source/config identities.
+Their request budgets are 1628 and 3128 tokens, within unchanged context4096.
 
 Requests explicitly disable prompt reuse, ignore EOS and use deterministic
 sampling. Native `prompt_n`, `predicted_n`, `cache_n`, truncation and positive

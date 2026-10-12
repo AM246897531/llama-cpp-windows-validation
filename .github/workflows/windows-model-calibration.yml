@@ -8,9 +8,9 @@ on:
       probe:
         description: Selected bounded performance probe; all runs the protocol matrix
         required: true
-        default: pp1500
+        default: tg128-1500
         type: choice
-        options: [pp500, pp1500, pp3000, tg128, full-context, thermal, all]
+        options: [pp500, pp1500, pp3000, tg128, tg128-1500, tg128-3000, full-context, thermal, all]
       ballast:
         description: Owned ballast GiB; unsafe cases are rejected before model download
         required: true
@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        probe: ${{ fromJSON(inputs.probe == 'all' && '["pp500","pp1500","pp3000","tg128","full-context","thermal"]' || format('["{0}"]', inputs.probe || 'pp1500')) }}
+        probe: ${{ fromJSON(inputs.probe == 'all' && '["pp500","pp1500","pp3000","tg128","tg128-1500","tg128-3000","full-context","thermal"]' || format('["{0}"]', inputs.probe || 'tg128-1500')) }}
         ballast: ${{ fromJSON(format('[{0}]', inputs.ballast || '0')) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
